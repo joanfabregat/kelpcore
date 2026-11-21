@@ -1,6 +1,6 @@
 # Architecture
 
-> Server-relevant sections of [KelpMux docs/architecture.md](https://github.com/joanfabregat/kelpmux/blob/eb31da5/docs/architecture.md) at `eb31da5`, copied when KelpServer moved to its own repository. Frontend, TUI layout and legacy tmux material stays in KelpMux. "Kelpmux" below refers to the combined product at the time of writing; the behavior described is implemented by KelpServer.
+> Server-relevant sections of [KelpMux docs/architecture.md](https://github.com/joanfabregat/kelpmux/blob/eb31da5/docs/architecture.md) at `eb31da5`, copied when KelpServer moved to its own repository, with later server changes from KelpMux `cfe28de` (pane environment, startup-dialog activity). Frontend, TUI layout and legacy tmux material stays in KelpMux. "Kelpmux" below refers to the combined product at the time of writing; the behavior described is implemented by KelpServer.
 
 KelpServer is the persistent server of native Kelp workspaces. It owns PTYs, interactive shells, terminal emulation, workspace geometry, agent metadata and client authorization. Clients (the KelpMux TUI, browser clients through `bridge`/`web-bridge`, and KelpHub) own presentation and input framing.
 
@@ -28,6 +28,8 @@ New Tab prepares a PTY before committing the new terminal. Changing the grid vie
 
 Screen resizes preserve every process, including foreground, background and stopped jobs. The separate legacy tmux helper retains its original occupancy guard; it does not control native workspaces.
 
+Panes are new top-level terminals, so their shells do not inherit the session markers of whoever started the server. KelpServer removes `CLAUDECODE`, every `CLAUDE_CODE_*` variable (for example `CLAUDE_CODE_CHILD_SESSION`, which makes Claude Code treat a new session as a child and turn off transcript saving, and `CLAUDE_CODE_MESSAGING_SOCKET`), `CLAUDE_PID`, `CLAUDE_EFFORT`, `CODEX_SESSION_ID`, `CODEX_THREAD_ID`, `CODEX_TOOL_CALL_ID`, `CODEX_CI`, `TMUX`, `TMUX_PANE`, `STY`, `SSH_CONNECTION`, `SSH_CLIENT`, `SSH_TTY` and `NO_COLOR`. User configuration is kept, including API keys, `CLAUDE_CONFIG_DIR` and `CODEX_HOME`, so a server started from inside an agent or tmux session still gives its panes a clean, configured environment. `start` also launches the background server process itself without the agent and multiplexer markers.
+
 ## Discovery and journal
 
 Native discovery reuses the process and transcript evidence adapters for Claude/Codex. The outermost recognizable interactive agent under a pane shell supplies metadata; headless tasks and shared app/MCP servers are excluded. PID plus process birth ticks guards against reuse. Session ID, title and lifecycle are evidence-derived, and missing or unbound evidence stays unknown. Some Codex shared-daemon TUIs therefore have unknown pane-bound session identity.
@@ -42,7 +44,7 @@ A named workspace selects its private state directory and socket. `start` create
 
 ## Phase-two boundaries
 
-Activity history persists bounded lifecycle metadata separately from terminal history. Discovery produces deduplicated transitions; initial state does not count as a fresh completion. Acknowledgements are persisted, and sound is opt-in in the frontend. Recovery collection uses a bounded background job with cancellation and nonblocking journal access, keeping the terminal I/O loop responsive.
+Activity history persists bounded lifecycle metadata separately from terminal history. Discovery produces deduplicated transitions; initial state does not count as a fresh completion, and an agent first seen waiting for input before it has a session (a startup dialog such as Claude Code's folder trust prompt) does not alert until it asks again later. Acknowledgements are persisted, and sound is opt-in in the frontend. Recovery collection uses a bounded background job with cancellation and nonblocking journal access, keeping the terminal I/O loop responsive.
 
 Scratch is a separate persistent PTY whose visibility overlays the base view. It is excluded from the automatic grid and parking. Closing the last main terminal creates a replacement main shell; a main-shell exit also retains a main shell when scratch exists, preserving its process. Templates prepare new PTYs with validated names and directories; they never reconfigure an existing live instance.
 
