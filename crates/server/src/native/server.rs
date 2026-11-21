@@ -1560,6 +1560,7 @@ impl Server {
         if is_scratch && self.workspace.ui.scratch_visible {
             self.workspace.apply(&Action::ScratchClose)?;
         }
+        self.workspace.track_focus();
         if !is_scratch {
             self.history.close(&self.epoch, id, crate::now());
             self.history
@@ -1570,12 +1571,17 @@ impl Server {
         self.aliases.remove(&id);
         self.workspace.ui.config.pane_colors.remove(&id);
         self.workspace.ui.unused.retain(|pane| *pane != id);
+        // Return to the previously focused tab; without one, the first.
         let fallback = self
             .workspace
-            .panes
-            .iter()
-            .find(|pane| !pane.parked && Some(pane.id) != self.workspace.ui.scratch)
-            .map(|pane| pane.id)
+            .previous_focus(id)
+            .or_else(|| {
+                self.workspace
+                    .panes
+                    .iter()
+                    .find(|pane| !pane.parked && Some(pane.id) != self.workspace.ui.scratch)
+                    .map(|pane| pane.id)
+            })
             .unwrap_or(0);
         if is_scratch {
             self.workspace.ui.scratch = None;
@@ -1822,6 +1828,8 @@ impl Server {
         Ok(())
     }
     fn resize(&mut self) {
+        // New and reopened tabs take focus outside `Workspace::apply`.
+        self.workspace.track_focus();
         self.workspace.reflow();
         for (id, cols, rows) in self.workspace.terminal_sizes() {
             if let Some(pane) = self.panes.get_mut(&id) {
