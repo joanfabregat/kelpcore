@@ -1,0 +1,16 @@
+KelpServer
+Copyright 2026 Joan Fabregat and Kelpmux contributors
+Licensed under the Apache License, Version 2.0.
+
+KelpServer was extracted from Kelpmux (https://github.com/joanfabregat/kelpmux)
+at commit eb31da5. The extracted code remains the work of Joan Fabregat and
+the Kelpmux contributors, under the same Apache-2.0 license.
+
+KelpServer uses Alacritty's terminal engine and other Rust dependencies,
+copyright their respective authors. Exact versions and license expressions
+are recorded in Cargo.lock and the dependency metadata. KelpServer's
+Apache-2.0 license does not replace those dependencies' licenses.
+
+Native status-bar metrics incorporate code adapted from Vitals
+(https://github.com/joanfabregat/vitals), Copyright (c) 2026 Joan Fabrégat,
+licensed under MIT. The complete license is in assets/licenses/vitals-MIT.txt at the repository root.
