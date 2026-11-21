@@ -3,6 +3,8 @@ use super::ui::{AgentFilter, Dialog, DialogKind, UiState};
 use crate::Result;
 pub const GRIDS: [(u8, u8); 6] = [(1, 1), (2, 1), (2, 2), (3, 2), (2, 3), (3, 3)];
 pub const GRID_DIVIDER_COLS: u16 = 2;
+/// Recently focused tabs remembered for choosing the next tab after a close or park.
+const FOCUS_HISTORY: usize = 32;
 
 #[derive(Debug, Clone)]
 pub struct Workspace {
@@ -16,6 +18,9 @@ pub struct Workspace {
     pub help: bool,
     pub ui: UiState,
     restore_origin: Option<Dialog>,
+    /// Recently focused main tabs, most recent last. In memory only, like
+    /// `active` itself; scratch and closed tabs are never selected from it.
+    focus_history: Vec<PaneId>,
 }
 impl Workspace {
     pub fn new(cols: u16, rows: u16) -> Result<Self> {
@@ -30,6 +35,7 @@ impl Workspace {
             grid_rows: 1,
             help: false,
             restore_origin: None,
+            focus_history: Vec::new(),
             ui: UiState {
                 grid_shape: (1, 1),
                 ..Default::default()
@@ -333,7 +339,41 @@ impl Workspace {
             .position(|p| p.id == id)
             .ok_or_else(|| "unknown pane".into())
     }
+    /// Records the active main tab as the most recently focused one. Focus
+    /// moves through many paths, so this runs around every action and before
+    /// the server picks a replacement for a closed tab.
+    pub fn track_focus(&mut self) {
+        let id = self.active;
+        if id == 0
+            || Some(id) == self.ui.scratch
+            || self.focus_history.last() == Some(&id)
+            || !self.panes.iter().any(|pane| pane.id == id)
+        {
+            return;
+        }
+        let panes = &self.panes;
+        self.focus_history
+            .retain(|entry| *entry != id && panes.iter().any(|pane| pane.id == *entry));
+        self.focus_history.push(id);
+        let excess = self.focus_history.len().saturating_sub(FOCUS_HISTORY);
+        self.focus_history.drain(..excess);
+    }
+    /// The most recently focused tab other than `leaving` that is still open,
+    /// unparked and not the scratch terminal.
+    pub fn previous_focus(&self, leaving: PaneId) -> Option<PaneId> {
+        self.focus_history.iter().rev().copied().find(|id| {
+            *id != leaving
+                && Some(*id) != self.ui.scratch
+                && self.panes.iter().any(|pane| pane.id == *id && !pane.parked)
+        })
+    }
     pub fn apply(&mut self, action: &Action) -> Result<()> {
+        self.track_focus();
+        let result = self.apply_action(action);
+        self.track_focus();
+        result
+    }
+    fn apply_action(&mut self, action: &Action) -> Result<()> {
         if !matches!(action, Action::GridDrag(_)) {
             self.ui.grid_drop = None;
         }
@@ -534,11 +574,15 @@ impl Workspace {
                 }
                 self.panes[index].parked = true;
                 if self.active == id {
+                    // Return to the previously focused tab; without one, the first.
                     self.active = self
-                        .panes
-                        .iter()
-                        .find(|p| !p.parked && Some(p.id) != self.ui.scratch)
-                        .map(|p| p.id)
+                        .previous_focus(id)
+                        .or_else(|| {
+                            self.panes
+                                .iter()
+                                .find(|p| !p.parked && Some(p.id) != self.ui.scratch)
+                                .map(|p| p.id)
+                        })
                         .unwrap_or(0);
                     if self.reading != ReadingMode::Grid {
                         self.reading = if self.active == 0 {
@@ -554,7 +598,12 @@ impl Workspace {
             Action::Restore(id) => {
                 let index = self.require_pane(id)?;
                 self.restore_origin = None;
-                self.panes[index].parked = false;
+                // An unparked tab rejoins the tab order as the last tab.
+                if self.panes[index].parked {
+                    let mut pane = self.panes.remove(index);
+                    pane.parked = false;
+                    self.panes.push(pane);
+                }
                 self.active = id;
                 if self.reading != ReadingMode::Grid {
                     self.reading = ReadingMode::Tabs(id);

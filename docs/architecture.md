@@ -1,6 +1,6 @@
 # Architecture
 
-> Server-relevant sections of [KelpMux docs/architecture.md](https://github.com/joanfabregat/kelpmux/blob/eb31da5/docs/architecture.md) at `eb31da5`, copied when KelpServer moved to its own repository. Frontend, TUI layout and legacy tmux material stays in KelpMux. "Kelpmux" below refers to the combined product at the time of writing; the behavior described is implemented by KelpServer.
+> Server-relevant sections of [KelpMux docs/architecture.md](https://github.com/joanfabregat/kelpmux/blob/eb31da5/docs/architecture.md) at `eb31da5`, copied when KelpServer moved to its own repository, with later server changes from KelpMux `cfe28de` (pane environment, startup-dialog activity). Frontend, TUI layout and legacy tmux material stays in KelpMux. "Kelpmux" below refers to the combined product at the time of writing; the behavior described is implemented by KelpServer.
 
 KelpServer is the persistent server of native Kelp workspaces. It owns PTYs, interactive shells, terminal emulation, workspace geometry, agent metadata and client authorization. Clients (the KelpMux TUI, browser clients through `bridge`/`web-bridge`, and KelpHub) own presentation and input framing.
 
@@ -24,9 +24,11 @@ Independent clients use the separate pane stream (version 1) over the same socke
 
 The pure workspace layer computes balanced geometry from unparked terminal count and controller dimensions. Rows divide the full width evenly, including partial rows, and rebalance as terminals or dimensions change. One row per pane is reserved for its header and the last terminal row for a shared footer; vertical separators use solid quarter-cell strokes. Pane identity and palette stay with the process while swaps change logical order and displayed numbers.
 
-New Tab prepares a PTY before committing the new terminal. Changing the grid view preserves the inventory of processes. Manual native layout and boundary-resize requests are rejected. Park/Restore modifies visibility and preserves IDs, PTYs, output and status; observers require control before changing it. Parking is not process suspension. Exact startup tab counts replace saved geometry, with legacy grid settings accepted as migration input. Shell exit removes its terminal and rebalances; explicit close requires confirmation. Last-shell exit detaches clients normally when there is no scratch terminal to preserve.
+New Tab prepares a PTY before committing the new terminal. Changing the grid view preserves the inventory of processes. Manual native layout and boundary-resize requests are rejected. Park/Restore modifies visibility and preserves IDs, PTYs, output and status; observers require control before changing it. Parking is not process suspension. A restored (unparked) tab rejoins the tab order as the last tab and takes focus. Closing or parking the current tab focuses the previously selected tab: the server keeps a short in-memory history of focused tabs, skips entries that have since been closed or parked, and falls back to the first visible tab when no earlier tab is known. The history is not persisted, like the active tab itself. Exact startup tab counts replace saved geometry, with legacy grid settings accepted as migration input. Shell exit removes its terminal and rebalances; explicit close requires confirmation. Last-shell exit detaches clients normally when there is no scratch terminal to preserve.
 
 Screen resizes preserve every process, including foreground, background and stopped jobs. The separate legacy tmux helper retains its original occupancy guard; it does not control native workspaces.
+
+Panes are new top-level terminals, so their shells do not inherit the session markers of whoever started the server. KelpServer removes `CLAUDECODE`, every `CLAUDE_CODE_*` variable (for example `CLAUDE_CODE_CHILD_SESSION`, which makes Claude Code treat a new session as a child and turn off transcript saving, and `CLAUDE_CODE_MESSAGING_SOCKET`), `CLAUDE_PID`, `CLAUDE_EFFORT`, `CODEX_SESSION_ID`, `CODEX_THREAD_ID`, `CODEX_TOOL_CALL_ID`, `CODEX_CI`, `TMUX`, `TMUX_PANE`, `STY`, `SSH_CONNECTION`, `SSH_CLIENT`, `SSH_TTY` and `NO_COLOR`. User configuration is kept, including API keys, `CLAUDE_CONFIG_DIR` and `CODEX_HOME`, so a server started from inside an agent or tmux session still gives its panes a clean, configured environment. `start` also launches the background server process itself without the agent and multiplexer markers.
 
 ## Discovery and journal
 
@@ -42,7 +44,7 @@ A named workspace selects its private state directory and socket. `start` create
 
 ## Phase-two boundaries
 
-Activity history persists bounded lifecycle metadata separately from terminal history. Discovery produces deduplicated transitions; initial state does not count as a fresh completion. Acknowledgements are persisted, and sound is opt-in in the frontend. Recovery collection uses a bounded background job with cancellation and nonblocking journal access, keeping the terminal I/O loop responsive.
+Activity history persists bounded lifecycle metadata separately from terminal history. Discovery produces deduplicated transitions; initial state does not count as a fresh completion, and an agent first seen waiting for input before it has a session (a startup dialog such as Claude Code's folder trust prompt) does not alert until it asks again later. Acknowledgements are persisted, and sound is opt-in in the frontend. Recovery collection uses a bounded background job with cancellation and nonblocking journal access, keeping the terminal I/O loop responsive.
 
 Scratch is a separate persistent PTY whose visibility overlays the base view. It is excluded from the automatic grid and parking. Closing the last main terminal creates a replacement main shell; a main-shell exit also retains a main shell when scratch exists, preserving its process. Templates prepare new PTYs with validated names and directories; they never reconfigure an existing live instance.
 
