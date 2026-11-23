@@ -13,7 +13,7 @@ This repository was previously KelpServer, extracted from [KelpMux](https://gith
 | `kelpserver` | [crates/server](crates/server) | Library and `kelpserver` executable: daemon, PTYs, terminal state, the stream protocol and its session API, SSH bridge |
 | `kelpclient-protocol` | [crates/protocol](crates/protocol) | Portable wire types, the stream version constant, cell validation and the binary screen codec, with no server, client-state or WASM dependency (it builds for `wasm32-unknown-unknown`) |
 | `kelpclient` | [crates/client](crates/client) | The Rust client core: screen snapshots and updates, revision tracking, framing, selection and history layout. Used natively by the TUI and compiled to WASM (`client-core.wasm`) for browsers |
-| `@kelpcore/web` (npm, not published) | [web](web) | The browser layer both web clients use: WebGL/Canvas renderer, in-browser SSH with WebAuthn keys, the shared worker session, keyboard, mouse, wheel and touch-key encoding, uploads, and the `Terminal` React component. TypeScript sources, compiled by the consuming application's build |
+| `@kelpcore/web` (npm, not published) | [web](web) | The browser layer both web clients use: WebGL/Canvas renderer, in-browser SSH with WebAuthn keys, the shared worker session, keyboard, mouse, wheel and touch-key encoding, uploads, the `Terminal` React component, and the file browser's request client, path and document models and CodeMirror 6 text editor (`files/`, derived from KelpHub). TypeScript sources, compiled by the consuming application's build |
 
 The package and executable names are historical and kept so that existing consumers change only the repository URL of their pins.
 
@@ -61,7 +61,7 @@ The browser layer is an npm Git dependency at the same commit:
 }
 ```
 
-The package is private (never published) and exposes its TypeScript sources through `exports` (`"./*": "./web/src/*"`), so imports name the file with its extension, for example `@kelpcore/web/renderer.ts`, `@kelpcore/web/Terminal.tsx`, `@kelpcore/web/ssh/wire.mjs` and `@kelpcore/web/terminal.css`. The application's bundler compiles them; there is no build step in this package. `react` (19) is a peer dependency.
+The package is private (never published) and exposes its TypeScript sources through `exports` (`"./*": "./web/src/*"`), so imports name the file with its extension, for example `@kelpcore/web/renderer.ts`, `@kelpcore/web/Terminal.tsx`, `@kelpcore/web/ssh/wire.mjs` and `@kelpcore/web/terminal.css`. The application's bundler compiles them; there is no build step in this package. `react` (19) is a peer dependency. The CodeMirror 6 and Lezer packages that `files/editor.tsx` imports are regular dependencies (exact versions), installed with the package; an application should load the editor lazily (`import("@kelpcore/web/files/editor.tsx")`) so they stay out of its main bundle, and ship their MIT license texts.
 
 ### What the application serves
 

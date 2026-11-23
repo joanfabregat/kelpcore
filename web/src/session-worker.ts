@@ -213,6 +213,56 @@ function uploadFrom(view: View, type: string, params: any) {
   }
   ssh.request(type, params);
 }
+/** Correlated stream requests whose replies belong to the window that sent
+ * them, and only to it: KelpServer's `files` requests (a browser's file
+ * browser and editor). Each request's identifier maps to its window until
+ * the reply arrives; a window that leaves keeps its entries (as
+ * `undefined`) so their late replies are dropped rather than broadcast. A
+ * reply is any event naming the request: the `file_*` reply, `done`, or an
+ * `error`. Further request types of this kind only need adding here. */
+const correlatedTypes = new Set([
+  "file_list",
+  "file_stat",
+  "file_read",
+  "file_write",
+  "file_mkdir",
+  "file_rename",
+  "file_trash",
+  "file_delete",
+]);
+/** Requests that change something: they count as user activity. */
+const deliberateTypes = new Set([
+  "file_write",
+  "file_mkdir",
+  "file_rename",
+  "file_trash",
+  "file_delete",
+]);
+const correlated = new Map<string, View | undefined>();
+/** Bound on replies awaited across windows (the server runs at most a few
+ * file requests per connection; the rest wait in the windows). */
+const MAX_CORRELATED = 1024;
+function correlatedFrom(view: View, type: string, params: any) {
+  if (!ssh) return;
+  if (typeof params.request !== "string" || !uploadRequest.test(params.request))
+    throw Error("Invalid request identifier");
+  if (correlated.has(params.request) || uploadRequests.has(params.request))
+    throw Error("Duplicate request identifier");
+  if (correlated.size >= MAX_CORRELATED)
+    throw Error("Too many requests waiting for replies");
+  correlated.set(params.request, view);
+  if (deliberateTypes.has(type)) active();
+  ssh.request(type, params);
+}
+/** Routes the reply of a correlated request; true when it was one. */
+function correlatedEvent(value: any): boolean {
+  const request = value.Stream?.request;
+  if (typeof request !== "string" || !correlated.has(request)) return false;
+  const view = correlated.get(request);
+  correlated.delete(request);
+  if (view) send(view, { type: "event", event: value });
+  return true;
+}
 function send(view: View, value: any) {
   if (views.has(view) && (view.ready || value.type === "closed"))
     view.port.postMessage(value);
@@ -238,6 +288,7 @@ function stop(message = "Signed out of all KelpMux windows.") {
   claiming.clear();
   screens.clear();
   uploadRequests.clear();
+  correlated.clear();
   batches.clear();
   queuedChunks.length = 0;
   chunksInFlight = 0;
@@ -270,6 +321,8 @@ function leave(view: View) {
     if (entry.view === view) cancelBatch(batch);
   for (const entry of uploadRequests.values())
     if (entry.view === view) entry.view = undefined;
+  for (const [request, owner] of correlated)
+    if (owner === view) correlated.set(request, undefined);
   for (const [pane, owner] of owners)
     if (owner === view) {
       owners.delete(pane);
@@ -308,6 +361,7 @@ function event(value: any) {
     uploadEvent(value);
     return;
   }
+  if (correlatedEvent(value)) return;
   if (e.type === "welcome") {
     welcome = e;
     stopped = undefined;
@@ -570,6 +624,10 @@ async function message(view: View, data: any) {
       // An upload is deliberate, like typing: it keeps the session open.
       active();
       uploadFrom(view, type, params);
+      return;
+    }
+    if (correlatedTypes.has(type)) {
+      correlatedFrom(view, type, params);
       return;
     }
     if (type === "acknowledge") {
