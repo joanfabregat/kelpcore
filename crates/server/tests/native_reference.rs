@@ -15,6 +15,7 @@ fn hello() -> Event {
         limits: None,
         notification_run: None,
         upload_limits: None,
+        file_limits: None,
     }
 }
 fn snapshot(pane: u64) -> PaneSnapshot {
@@ -107,6 +108,7 @@ fn epoch_handshake_and_missing_baseline_errors_are_transactional() {
                 limits: None,
                 notification_run: None,
                 upload_limits: None,
+                file_limits: None,
             })
             .is_err()
     );

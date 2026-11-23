@@ -51,6 +51,7 @@ impl Daemon {
                 dir: Some(uploads),
                 retention_days,
             },
+            files: Default::default(),
         };
         let handle = thread::spawn(move || serve(config));
         let daemon = Self {

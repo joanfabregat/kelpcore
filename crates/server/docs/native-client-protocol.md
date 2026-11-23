@@ -28,7 +28,7 @@ Every record has a four-byte unsigned big-endian payload length followed by UTF-
 {"Stream":{"type":"hello","version":1}}
 ```
 
-The server responds with `Stream` / `welcome`, containing stream version, connection/client ID, a random server epoch, and supported capabilities. Send Hello exactly once before other stream requests. Unsupported versions fail clearly. Current capabilities are `pane-snapshots`, `pane-patches`, `pane-leases`, `metadata`, `notifications`, `vitals`, `hyperlinks`, `program-status`, `controller-theme` and `clipboard-write`, plus the [session API](#session-api) capabilities `pane-lifecycle`, `closed-sessions`, `pane-history`, `pane-scroll`, `notification-ack-all`, `host-status`, `server-lifecycle`, `startup-policy`, `recovery-signal`, `spawn-shell`, `unused-shell`, `stream-limits`, `notification-run`, `spawned-by`, `diagnostics`, `uploads` and `binary-screens`; do not infer support for undeclared future capabilities. A server with `server-lifecycle` also puts its package version in Welcome `server_version`.
+The server responds with `Stream` / `welcome`, containing stream version, connection/client ID, a random server epoch, and supported capabilities. Send Hello exactly once before other stream requests. Unsupported versions fail clearly. Current capabilities are `pane-snapshots`, `pane-patches`, `pane-leases`, `metadata`, `notifications`, `vitals`, `hyperlinks`, `program-status`, `controller-theme` and `clipboard-write`, plus the [session API](#session-api) capabilities `pane-lifecycle`, `closed-sessions`, `pane-history`, `pane-scroll`, `notification-ack-all`, `host-status`, `server-lifecycle`, `startup-policy`, `recovery-signal`, `spawn-shell`, `unused-shell`, `stream-limits`, `notification-run`, `spawned-by`, `diagnostics`, `uploads`, `binary-screens` and `files`; do not infer support for undeclared future capabilities. A server with `server-lifecycle` also puts its package version in Welcome `server_version`.
 
 The socket envelope has three client records and three server records. A client sends `{"Stream":{…}}` requests, or the one-shot `"Diagnostics"` on a connection that has not sent Hello. The server sends `{"Stream":{…}}` events, `{"Diagnostics":{…}}` in reply to the one-shot request, and `{"Error":"…"}` for a record it cannot accept. A record it cannot decode, such as one of the removed composed protocol 58 (`Attach`, `Command`, `Inspect`, `SpawnPane`, …), gets an `Error` that names the removal and the connection closes, so an old client reports an incompatible server instead of hanging. A stream connection that sends `"Diagnostics"` gets an `Error` and keeps its connection. The bridge accepts only stream requests.
 
@@ -114,20 +114,21 @@ The stream stays at version 1; nothing in v1 changed meaning. Every addition is 
 | `diagnostics` | `diagnostics` | `diagnostics` |
 | `uploads` | `upload_begin`, `upload_chunk`, `upload_finish`, `upload_cancel` | `upload_started`, `upload_progress`, `upload_done`, `upload_failed`, `done`, Welcome `upload_limits` |
 | `binary-screens` | `binary_screens {enabled}` | `Update.binary_screens`, and a binary screen record after each update ([binary-screens.md](binary-screens.md)) |
+| `files` | `file_list`, `file_stat`, `file_read`, `file_write`, `file_mkdir`, `file_rename`, `file_trash`, `file_delete` | `file_list`, `file_stat`, `file_content`, `file_written`, `file_removed`, `file_error`, `done`, Welcome `file_limits` |
 
 Rules that keep older peers working:
 
-- A connection receives an event of a new type only after it opts in (`session_events`, `host_status`) or as the reply to a request it sent. Existing clients that reject unknown event types (KelpClient, KelpHub's bridge) therefore never see one. `Update.sessions` and `Update.host` are omitted unless enabled. Step 2 adds no event type; step 3 adds the `diagnostics` reply; `uploads` adds only replies to its own requests. Binary screen records reach only a connection that sent `binary_screens {enabled: true}`, and every one directly follows an `update` with `binary_screens: true`.
-- New fields on existing messages (`Welcome.server_version`, `Welcome.startup_panes`, `Welcome.recovery_pending`, `Welcome.limits`, `Welcome.notification_run`, `Welcome.upload_limits`, `Error.request`, `Update.sessions`, `Update.host`, `Update.binary_screens`, `PaneSession.unused_shell`, `PaneSession.spawned_by`) are optional; decoders that ignore unknown fields are unaffected. Absent fields are omitted from the wire (`recovery_pending` and `binary_screens` when false, `spawned_by` when unknown).
+- A connection receives an event of a new type only after it opts in (`session_events`, `host_status`) or as the reply to a request it sent. Existing clients that reject unknown event types (KelpClient, KelpHub's bridge) therefore never see one. `Update.sessions` and `Update.host` are omitted unless enabled. Step 2 adds no event type; step 3 adds the `diagnostics` reply; `uploads` and `files` add only replies to their own requests. Binary screen records reach only a connection that sent `binary_screens {enabled: true}`, and every one directly follows an `update` with `binary_screens: true`.
+- New fields on existing messages (`Welcome.server_version`, `Welcome.startup_panes`, `Welcome.recovery_pending`, `Welcome.limits`, `Welcome.notification_run`, `Welcome.upload_limits`, `Welcome.file_limits`, `Error.request`, `Update.sessions`, `Update.host`, `Update.binary_screens`, `PaneSession.unused_shell`, `PaneSession.spawned_by`) are optional; decoders that ignore unknown fields are unaffected. Absent fields are omitted from the wire (`recovery_pending` and `binary_screens` when false, `spawned_by` when unknown).
 - `spawn` without a shell serializes exactly as before, so it stays valid for a server without `spawn-shell`; with `shell`, such a server rejects the request.
 - A server without a capability disconnects a connection that sends an unknown request type. Check the Welcome capabilities before sending any request listed above.
 - The SSH bridge relays every stream request after Hello, so the session API works through `kelpserver bridge` unchanged. It relays binary screen records to the client without parsing them.
 
-In the Rust API, `Event::Welcome`, `Event::Error` and `Update` gained fields and `Request`/`Event` gained variants, so exhaustive matches and struct literals in consumers need updating when they move their pin. Step 2 adds fields to `Event::Welcome`, `Request::Spawn`, `PaneSession` and `ServerConfig`, and the `Request::DismissRecovery` variant; patterns with `..` are unaffected. Step 3 (0.3.0, a breaking release) removes `StartupPanes::Layout`, the composed `ClientMessage`/`ServerMessage` variants (only `Stream`, `Error` and `Diagnostics` remain) and the UI fields of `ServerConfig` (it keeps `socket`, `state_dir`, `shell`, `cwd`, `cols` and `rows`), and adds `Request::Diagnostics` and `Event::Diagnostics`. 0.3.0-beta.2 removes the client presentation left in step 3: the `native::web_relay` and `native::templates` modules, the vitals presentation functions, `history::RestoreChoice` and `Entry::restore_choices`, `upgrade::attach_matching` and `upgrade::matching_binary`, the crate-root `label`, the alias parameter of `tracking::tab_name` and `tracking::shell_tab_name`, and in `kelpclient-protocol` 0.3.0 the `PaneInfo` fields `parked`, `number` and `palette`, `Status::text`, `Status::marker`, `WORKING_FRAMES` and `StatusSource::label`. The `uploads` capability adds `Event::Welcome.upload_limits`, `ServerConfig.uploads` (`uploads::Settings`), the `lifecycle::Settings` fields `upload_dir` and `upload_retention_days`, the `Request::Upload{Begin,Chunk,Finish,Cancel}` and `Event::Upload{Started,Progress,Done,Failed}` variants and the `uploads` module. The `binary-screens` capability adds `Request::BinaryScreens`, `Update.binary_screens`, `protocol::read_frame`, `protocol::read_server_record` and `protocol::ServerRecord`, and in `kelpclient-protocol` the `screens` module and `Hash` on `Color`; `PaneSnapshot` and `PanePatch` moved to `kelpclient-protocol` and stay re-exported from `stream`.
+In the Rust API, `Event::Welcome`, `Event::Error` and `Update` gained fields and `Request`/`Event` gained variants, so exhaustive matches and struct literals in consumers need updating when they move their pin. Step 2 adds fields to `Event::Welcome`, `Request::Spawn`, `PaneSession` and `ServerConfig`, and the `Request::DismissRecovery` variant; patterns with `..` are unaffected. Step 3 (0.3.0, a breaking release) removes `StartupPanes::Layout`, the composed `ClientMessage`/`ServerMessage` variants (only `Stream`, `Error` and `Diagnostics` remain) and the UI fields of `ServerConfig` (it keeps `socket`, `state_dir`, `shell`, `cwd`, `cols` and `rows`), and adds `Request::Diagnostics` and `Event::Diagnostics`. 0.3.0-beta.2 removes the client presentation left in step 3: the `native::web_relay` and `native::templates` modules, the vitals presentation functions, `history::RestoreChoice` and `Entry::restore_choices`, `upgrade::attach_matching` and `upgrade::matching_binary`, the crate-root `label`, the alias parameter of `tracking::tab_name` and `tracking::shell_tab_name`, and in `kelpclient-protocol` 0.3.0 the `PaneInfo` fields `parked`, `number` and `palette`, `Status::text`, `Status::marker`, `WORKING_FRAMES` and `StatusSource::label`. The `uploads` capability adds `Event::Welcome.upload_limits`, `ServerConfig.uploads` (`uploads::Settings`), the `lifecycle::Settings` fields `upload_dir` and `upload_retention_days`, the `Request::Upload{Begin,Chunk,Finish,Cancel}` and `Event::Upload{Started,Progress,Done,Failed}` variants and the `uploads` module. The `binary-screens` capability adds `Request::BinaryScreens`, `Update.binary_screens`, `protocol::read_frame`, `protocol::read_server_record` and `protocol::ServerRecord`, and in `kelpclient-protocol` the `screens` module and `Hash` on `Color`; `PaneSnapshot` and `PanePatch` moved to `kelpclient-protocol` and stay re-exported from `stream`. The `files` capability adds `Event::Welcome.file_limits`, `ServerConfig.files` (`files::Settings`), the `Request::File{List,Stat,Read,Write,Mkdir,Rename,Trash,Delete}` and `Event::File{List,Stat,Content,Written,Removed,Error}` variants and the `files` module.
 
 ### Correlation and errors
 
-Requests that have a reply carry a client-chosen `request` string of 1–128 ASCII letters, digits, `-` or `_`. The reply echoes it, and so does `{"type":"error","message":…,"request":…}` when such a request fails. A malformed identifier fails with an error without `request`. Errors of v1 requests still have no `request`. Fire-and-forget requests (`scroll`, `reveal`, `acknowledge_all`, the opt-ins) have no identifier and no reply, like `resize` or `acknowledge`.
+Requests that have a reply carry a client-chosen `request` string of 1–128 ASCII letters, digits, `-` or `_`. The reply echoes it, and so does `{"type":"error","message":…,"request":…}` when such a request fails. File requests (`files`) fail with a structured `{"type":"file_error","request":…,"error":{"code":…}}` instead; see [Files](#files-files). A malformed identifier fails with an error without `request`. Errors of v1 requests still have no `request`. Fire-and-forget requests (`scroll`, `reveal`, `acknowledge_all`, the opt-ins) have no identifier and no reply, like `resize` or `acknowledge`.
 
 ### Pane lifecycle (`pane-lifecycle`)
 
@@ -292,6 +293,114 @@ removes the batch and its files. Cancelling a batch of this connection that alre
 **Connection scope.** A batch belongs to its connection. When the connection ends (disconnect, slow-peer disconnect, server shutdown), its unfinished batches are removed with their partial files. A completed batch stays on disk.
 
 **Retention.** The server records each batch it creates in `uploads.json` in its state directory: the batch directory's path, device and inode, creation time and, once finished, completion time. At startup and then hourly it deletes completed batches older than the retention (default 7 days; `--upload-retention-days N` or `upload_retention_days` in the configuration file; `0` keeps them forever) and unfinished batches left by a previous run. Only registered directories whose device and inode still match, owned by the server's user, are deleted; a registered path that is now missing, a symlink or another directory is forgotten without deleting anything. Deletion works through directory descriptors and never follows symlinks (a symlink inside a batch is removed, not its target). Files that are not registered batches, including anything else in the upload directory or in a `dest`, are never deleted. `kelpserver start --upload-dir` and `--upload-retention-days` store `upload_dir` and `upload_retention_days` in `workspace.json`; they take effect when the server next starts.
+
+### Files (`files`)
+
+File browsers and editors in clients list, read and change files on the host where the server and its shells run (the user's machine for a local server, the workspace pod for a containerized one). The client owns the browser and editor UI. File requests are not tied to a pane and need no lease. ADR 0003 section 3 ([KelpCore ADR 0003](../../../docs/adr/0003-kelpcore-shared-repository.md)).
+
+**Authorization and threat model.** Any stream connection may use them, with the same trust as uploads and as typing into a shell: a connection that can send input to a pane can already read and change every file the server's user can. The operations run with the server's own credentials and never elevate; the security boundary stays the authenticated stream connection (the private socket, or SSH for a bridge). They add no confinement to a directory either. What they guarantee is that they never act through a symlink at the final component of a change, never follow a symlink while deleting a tree, write atomically, and stay within bounded resources. Clients that relay other users' requests (a multi-user web front end) must apply their own policy before relaying file requests.
+
+**Limits.** Welcome carries `file_limits`; read them rather than hardcoding them:
+
+```json
+{"Stream":{"type":"welcome",…,"capabilities":[…,"files"],"file_limits":{"max_read_bytes":8388608,"max_write_bytes":8388608,"max_list_entries":5000,"max_paths":256,"max_in_flight":4,"max_path_bytes":4096,"max_depth":64}}}
+```
+
+- `max_read_bytes`: largest file `file_read` returns (8 MiB). Its base64 form fits one 16 MiB record.
+- `max_write_bytes`: largest decoded `file_write` content (8 MiB).
+- `max_list_entries`: entries in one `file_list` reply (5,000; a listing scans at most 200,000 directory entries).
+- `max_paths`: paths in one `file_trash` or `file_delete` (256).
+- `max_in_flight`: file requests of one connection running at once (4). The server runs at most 16 in total, of which at most 4 `file_delete`. A request over a bound gets `file_error` `busy` at once; retry after a reply arrives. A request counts until its reply has entered the connection's output queue, so a connection that does not read its replies keeps its slots.
+- `max_path_bytes`: longest path (4,096 bytes).
+- `max_depth`: deepest directory nesting `file_delete` removes (64).
+
+**Paths.** Every path is a string: absolute (`/home/me/notes.txt`), or `~` / `~/…`, relative to the server user's `HOME`. The server normalises it lexically: repeated `/`, `.` components and a trailing `/` are dropped. `..` components, `~user`, relative paths, NUL and paths over `max_path_bytes` are refused (`invalid_path`). Replies carry the normalised absolute path, so a client learns what `~` expanded to. Names that are not UTF-8 cannot be addressed and are left out of listings (counted in `skipped`).
+
+**Symlinks.** Intermediate components are resolved like a shell does (a symlinked parent directory works). Reads and listings follow a symlink at the final component too; `file_stat` and listing entries describe the symlink itself and report its `target` as text, without following it. Every change acts on the final component through its parent directory's descriptor and never follows a symlink there: `file_write` to a symlink fails with `symlink`; `file_rename`, `file_trash` and `file_delete` move or remove the link itself, never its target; recursive deletion opens each directory with `O_NOFOLLOW`, so a symlink inside a tree is unlinked, not followed.
+
+**Entries.** `file_list` and `file_stat` describe entries as:
+
+```json
+{"name":"run.sh","kind":"file","size":120,"modified":1795300000,"mode":493}
+{"name":"current","kind":"symlink","size":7,"modified":1795300000,"mode":511,"target":"release"}
+```
+
+`kind` is `file`, `dir`, `symlink` or `other` (FIFO, socket, device). `modified` is in Unix seconds. `mode` holds the permission bits including set-id and sticky (`st_mode & 0o7777`); the entry is executable when `mode & 0o111` is not zero. `target` (symlinks only) is the link text, at most 4,096 bytes, with invalid UTF-8 replaced.
+
+**List.**
+
+```json
+{"Stream":{"type":"file_list","request":"f1","path":"~/project"}}
+{"Stream":{"type":"file_list","request":"f1","path":"/home/me/project","entries":[{"name":"src","kind":"dir",…},{"name":"README.md","kind":"file",…}],"truncated":false,"skipped":0}}
+```
+
+Directories come first, then every other entry, each group in byte order of the name; a symlink to a directory sorts with the files. A larger directory returns its first `max_list_entries` entries in this order: the server selects them while scanning, holding and examining only those. `truncated` is true when entries were left out (over `max_list_entries`, the scan bound, or the record budget); past the scan bound, the entries are the first of those scanned, in the directory's own order.
+
+**Stat.** `{"type":"file_stat","request":"f2","path":"/home/me/project/run.sh"}` replies `{"type":"file_stat","request":"f2","path":"/home/me/project/run.sh","entry":{…}}`. `/` has the name `/`.
+
+**Read.**
+
+```json
+{"Stream":{"type":"file_read","request":"f3","path":"/home/me/project/README.md"}}
+{"Stream":{"type":"file_content","request":"f3","path":"/home/me/project/README.md","size":12,"modified":1795300000,"mode":420,"hash":"e3b0…","binary":false,"encoding":"utf8","content":"# Project\n\n"}}
+```
+
+Only regular files are read (`is_a_directory`, `not_a_file` otherwise); the type is checked before the file is opened, so reading a FIFO or device path never opens it. The whole file is returned or nothing: `max_bytes` (optional, at most `max_read_bytes`, which is also the default) refuses a larger file with `too_large`, whose `size` gives the file's size, so a client can offer a preview with a smaller bound or decline. `hash` is the lowercase hexadecimal SHA-256 of the content. `binary` is true when the bytes contain NUL or are not valid UTF-8. `encoding` says how `content` is carried: `utf8` (the text itself) for text, `base64` (standard alphabet, padded) for binary content, and also for text whose JSON escaping would not fit the record (text made mostly of control characters).
+
+**Write.**
+
+```json
+{"Stream":{"type":"file_write","request":"f4","path":"/home/me/project/README.md","content":"# Project\n","base_hash":"e3b0…"}}
+{"Stream":{"type":"file_written","request":"f4","path":"/home/me/project/README.md","hash":"5f1b…","size":10,"modified":1795300100,"created":false}}
+```
+
+`encoding` (`utf8` by default, or `base64`) says how `content` is carried; use `base64` for binary content, or for text whose JSON escaping would exceed the 16 MiB record. Without `create`, the file must exist and be a regular file owned by the server's user, not a symlink, and writable by its owner: a read-only file is refused with `permission_denied`, as a shell's `>` refuses it (unless the server runs as root). It is replaced atomically: the content goes to a new temporary file in the same directory (`.kelpserver-<random>.tmp`, created with `O_EXCL` and `O_NOFOLLOW`), which takes the existing file's group (when the user may set it) and permission bits (without set-id bits), is synced, and is renamed over the target, then the directory is synced. Readers see the old or the new content, never a mix. A replacement is a new inode, so hard links to the old file keep the old content, the owner is the server's user, and extended attributes and ACLs are not carried over. With `base_hash`, the write happens only if the current content's SHA-256 equals it (compared case-insensitively); otherwise nothing is written and the reply is `file_error` `conflict` carrying `current_hash`. A file now larger than `max_read_bytes` is a `conflict` without hashing it (no client can have read it whole), with `size` and without `current_hash`. Just before the rename, the file's device, inode, size, modification and change times are compared with those seen when it was hashed; any difference (the file replaced, or changed in place) is a `conflict` without `current_hash`, and nothing is written. Only a change landing between that comparison and the rename (microseconds) is overwritten. Without `base_hash` the write is unconditional, except that a file replaced by another inode meanwhile is refused as `conflict`.
+
+With `"create":true` the file must not exist (`exists` otherwise, also for a dangling symlink): the temporary file gets mode 0666 less the server's umask, like a file a shell creates, and is renamed into place without replacing anything (`RENAME_NOREPLACE`; on a file system without it, a check followed by a rename). `base_hash` cannot be combined with `create` (`invalid_request`). The parent directory must exist.
+
+**Create a folder.** `{"type":"file_mkdir","request":"f5","path":"/home/me/project/new"}` replies `done`. One level only: a missing parent is `not_found`, an existing entry `exists`. The mode is 0777 less the umask.
+
+**Rename and move.**
+
+```json
+{"Stream":{"type":"file_rename","request":"f6","from":"/home/me/a.txt","to":"/home/me/docs/a.txt"}}
+{"Stream":{"type":"done","request":"f6"}}
+```
+
+Moves an entry (a directory with its contents, a symlink as a link) within one file system; across file systems it fails with `cross_device` and nothing changes (a client can copy and delete itself). An existing `to` is never replaced unless `"overwrite":true`, which uses the system's rename rules (a file or link replaces a file, a directory replaces an empty directory). The refusal is `exists` with `path` set to `to`.
+
+**Move to the trash.**
+
+```json
+{"Stream":{"type":"file_trash","request":"f7","paths":["/home/me/old.txt","/home/me/build"]}}
+{"Stream":{"type":"file_removed","request":"f7","removed":[{"path":"/home/me/old.txt","trashed_as":"/home/me/.local/share/Trash/files/old.txt"}],"failed":[{"path":"/home/me/build","error":{"code":"permission_denied","message":"…","path":"/home/me/build"}}]}}
+```
+
+Entries go to the [freedesktop.org home trash](https://specifications.freedesktop.org/trash-spec/latest/): `$XDG_DATA_HOME/Trash` (when absolute), otherwise `~/.local/share/Trash`, whose `files/` and `info/` directories are created private (0700) when missing. For each path the server first reserves `info/<name>.trashinfo` with `O_EXCL` and writes and syncs
+
+```
+[Trash Info]
+Path=/home/me/my%20notes.txt
+DeletionDate=2026-11-23T10:04:05
+```
+
+(`Path` is the normalised absolute path, percent-encoded as in a file URL: every byte except `A–Z a–z 0–9 - . _ ~ /`; `DeletionDate` is the server's local time), and syncs `info/`, then renames the entry to `files/<name>` without replacing anything and syncs `files/` and the entry's former directory. A name already taken in `files/` or `info/` gets a number before its extension: `a.txt`, `a.2.txt`, `a.3.txt`, …; names are shortened so the `.trashinfo` name stays within 255 bytes. If the move fails, the info file is removed again. Desktop file managers show and restore these entries. Only the home trash is used: an entry on another file system than the trash fails with `cross_device` (per-volume `.Trash-$uid` directories are not implemented; delete such entries instead). The `directorysizes` cache is not written; the specification makes it optional.
+
+**Delete permanently.** `{"type":"file_delete","request":"f8","paths":[…]}` removes each entry at once: a file or symlink is unlinked, a directory is removed with its whole tree, never following a symlink (a symlink to a directory removes the link only; a symlink inside the tree is unlinked, its target is untouched). A tree nested deeper than `max_depth` fails with `too_large`, and like `rm --one-file-system` a deletion never enters another file system: a mount point inside the tree fails with `cross_device`. A directory that keeps listing entries that cannot be removed fails with `io` instead of being retried forever. Whatever was removed before such a failure stays removed, as with any failure part way through a tree (for example a directory without write permission). The reply is `file_removed` without `trashed_as`.
+
+Neither removes `/` (it has no name: `invalid_path`) nor the server user's home directory itself, under any path that names that directory (`invalid_request`); a symlink to either is only a link and is removed as one.
+
+For both, the paths (1 to `max_paths`) are validated first: one invalid path refuses the whole request with `file_error` and removes nothing. Then every path is attempted in order; each one is in `removed` or, with its error, in `failed`, so one missing entry does not stop the others.
+
+**Errors.** A failed or refused file request gets one reply. Apart from a tree deletion that fails part way, it changes nothing:
+
+```json
+{"Stream":{"type":"file_error","request":"f4","error":{"code":"conflict","message":"the file changed since it was read","path":"/home/me/project/README.md","current_hash":"9a0c…"}}}
+```
+
+`code` is one of `invalid_path`, `invalid_request`, `invalid_content` (base64 that does not decode), `not_found`, `permission_denied`, `not_a_directory`, `is_a_directory`, `not_a_file`, `symlink`, `exists`, `not_empty`, `conflict` (with `current_hash` when the content was hashed), `too_large` (with `size` for a file that is too large to read), `cross_device`, `read_only`, `no_space`, `busy` and `io` (any other system error; `message` has its description). `path` names the path the error concerns when there is one. A malformed `request` identifier is still a plain `error` without `request`, as for every request.
+
+**Threading.** File requests run on worker threads, so a slow disk or a large delete never delays pane output. Replies may therefore arrive in a different order than the requests and between other events; match them by `request`. A reply that does not fit the connection's output queue (several large reads finishing together, or a burst of `busy` refusals) waits for the queue to drain instead of disconnecting the client; a connection with more than 256 refusals waiting is disconnected as a slow peer. Running requests cannot be cancelled: one stuck on an unresponsive file system (a hung network mount) keeps its slot until the system call returns, and enough of them make every file request answer `busy` until it does or the server restarts. A server stopping while a request runs does not wait for it, and its reply is lost (a delete may then be partial).
 
 ### Parking and hidden panes
 

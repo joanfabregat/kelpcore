@@ -196,6 +196,7 @@ pub fn run(args: &[String]) -> Result<()> {
                 cols: options.size.0,
                 rows: options.size.1,
                 uploads: options.uploads,
+                files: Default::default(),
             })
         }
         "start" => {
