@@ -14,6 +14,9 @@ are recorded in Cargo.lock and the dependency metadata. KelpCore's
 Apache-2.0 license does not replace those dependencies' licenses.
 
 The browser layer is distributed as source; it bundles no third-party code.
+Its file editor depends on CodeMirror 6 and Lezer (MIT, Marijn Haverbeke
+and others), declared in package.json and installed by the consuming
+application, which must ship their license texts with its build.
 At runtime it loads assets the consuming application supplies: Chromium
 libapps WASSH/WASI bindings (BSD) and the upstream OpenSSH WASM client, which
 incorporates OpenSSL, zlib and ldns. Those assets and their license texts are
@@ -28,3 +31,9 @@ parts of the code of KelpHub's workspace file browser
 (server/src/management/files.rs at commit ed69304), Copyright 2026 Joan
 Fabregat, moved into KelpCore under the Apache License, Version 2.0, with
 the copyright holder's approval.
+
+The file browser and editor UI (web/src/files/: the request client, path
+and document models, language detection, the CodeMirror editor and its
+theme) is derived from KelpHub (web/src/files/ at commit 7057705),
+Copyright 2026 Joan Fabregat, moved with the copyright holder's approval
+into KelpCore under the Apache License, Version 2.0.

@@ -100,6 +100,48 @@ fn valid_request(value: &Value) -> bool {
 pub fn valid_upload_path(path: &str) -> bool {
     path.starts_with('/') && path.len() <= 4096 && !path.chars().any(char::is_control)
 }
+/// Most entries one `file_list` reply may carry. The server sends at most
+/// its `file_limits.max_list_entries` (5,000 by default); this bound only
+/// keeps a malformed reply from growing without limit.
+const MAX_FILE_ENTRIES: usize = 200_000;
+/// Most paths one `file_removed` reply may report.
+const MAX_FILE_PATHS: usize = 65_536;
+/// A path in a `files` reply: absolute, at most 4 KiB, without NUL.
+fn valid_file_path(value: &Value) -> bool {
+    value
+        .as_str()
+        .is_some_and(|path| path.starts_with('/') && path.len() <= 4096 && !path.contains('\0'))
+}
+/// A `files` entry: a name, a known kind and its numbers.
+fn valid_file_entry(entry: &Value) -> bool {
+    entry["name"]
+        .as_str()
+        .is_some_and(|name| !name.is_empty() && name.len() <= 4096 && !name.contains('\0'))
+        && matches!(
+            entry["kind"].as_str(),
+            Some("file" | "dir" | "symlink" | "other")
+        )
+        && entry["size"].as_u64().is_some()
+        && entry["modified"].as_i64().is_some()
+        && entry["mode"].as_u64().is_some()
+        && (entry["target"].is_null() || entry["target"].as_str().is_some())
+}
+/// A SHA-256 in hexadecimal, as `file_content` and `file_written` carry it.
+fn valid_hash(value: &Value) -> bool {
+    value
+        .as_str()
+        .is_some_and(|hash| hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+/// A `file_error` body: a code and a bounded message.
+fn valid_file_error(error: &Value) -> bool {
+    error["code"]
+        .as_str()
+        .is_some_and(|code| !code.is_empty() && code.len() <= 64)
+        && error["message"].as_str().is_some_and(|m| m.len() <= 65_536)
+        && (error["path"].is_null() || error["path"].as_str().is_some_and(|p| p.len() <= 4096))
+        && (error["current_hash"].is_null() || valid_hash(&error["current_hash"]))
+        && (error["size"].is_null() || error["size"].as_u64().is_some())
+}
 pub fn validate(snapshot: &PaneSnapshot) -> Result<()> {
     let screen = &snapshot.screen;
     if snapshot.pane == 0
@@ -327,6 +369,81 @@ impl Client {
             Some("done") => {
                 if !valid_request(&event["request"]) {
                     return Err("invalid request acknowledgement".into());
+                }
+            }
+            // `files` replies (KelpServer `files`): checked for their shape
+            // only. Paths are the server's normalised absolute paths and may
+            // hold any character a file name can, so clients quote them
+            // before pasting and refuse control characters there.
+            Some("file_list") => {
+                let entries = event["entries"].as_array();
+                if !valid_request(&event["request"])
+                    || !valid_file_path(&event["path"])
+                    || event["truncated"].as_bool().is_none()
+                    || event["skipped"].as_u64().is_none()
+                    || entries.is_none_or(|entries| {
+                        entries.len() > MAX_FILE_ENTRIES || !entries.iter().all(valid_file_entry)
+                    })
+                {
+                    return Err("invalid file listing".into());
+                }
+            }
+            Some("file_stat") => {
+                if !valid_request(&event["request"])
+                    || !valid_file_path(&event["path"])
+                    || !valid_file_entry(&event["entry"])
+                {
+                    return Err("invalid file status".into());
+                }
+            }
+            Some("file_content") => {
+                if !valid_request(&event["request"])
+                    || !valid_file_path(&event["path"])
+                    || event["size"].as_u64().is_none()
+                    || !valid_hash(&event["hash"])
+                    || event["binary"].as_bool().is_none()
+                    || !matches!(event["encoding"].as_str(), Some("utf8" | "base64"))
+                    || event["content"].as_str().is_none()
+                {
+                    return Err("invalid file content".into());
+                }
+            }
+            Some("file_written") => {
+                if !valid_request(&event["request"])
+                    || !valid_file_path(&event["path"])
+                    || !valid_hash(&event["hash"])
+                    || event["size"].as_u64().is_none()
+                    || event["created"].as_bool().is_none()
+                {
+                    return Err("invalid file write result".into());
+                }
+            }
+            Some("file_removed") => {
+                let removed = event["removed"].as_array();
+                let failed = event["failed"].as_array();
+                if !valid_request(&event["request"])
+                    || removed.is_none_or(|removed| {
+                        removed.len() > MAX_FILE_PATHS
+                            || removed.iter().any(|entry| {
+                                !valid_file_path(&entry["path"])
+                                    || !(entry["trashed_as"].is_null()
+                                        || valid_file_path(&entry["trashed_as"]))
+                            })
+                    })
+                    || failed.is_none_or(|failed| {
+                        failed.len() > MAX_FILE_PATHS
+                            || failed.iter().any(|entry| {
+                                !valid_file_path(&entry["path"])
+                                    || !valid_file_error(&entry["error"])
+                            })
+                    })
+                {
+                    return Err("invalid file removal result".into());
+                }
+            }
+            Some("file_error") => {
+                if !valid_request(&event["request"]) || !valid_file_error(&event["error"]) {
+                    return Err("invalid file error".into());
                 }
             }
             Some("lease") | Some("error") => {}

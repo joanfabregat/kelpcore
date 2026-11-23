@@ -136,6 +136,46 @@ fn upload_events_are_checked_before_their_paths_can_be_pasted() {
     }
 }
 
+#[test]
+fn file_replies_reach_the_page_when_well_formed() {
+    let hash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+    let mut client = Client::default();
+    for event in [
+        json!({"Stream":{"type":"file_list","request":"file-1","path":"/home/me","entries":[
+            {"name":"src","kind":"dir","size":4096,"modified":1795300000,"mode":493},
+            {"name":"current","kind":"symlink","size":7,"modified":1795300000,"mode":511,"target":"release"},
+            {"name":"line\nbreak.txt","kind":"file","size":0,"modified":-5,"mode":420}],
+            "truncated":false,"skipped":1}}),
+        json!({"Stream":{"type":"file_stat","request":"file-2","path":"/","entry":{"name":"/","kind":"dir","size":4096,"modified":1,"mode":493}}}),
+        json!({"Stream":{"type":"file_content","request":"file-3","path":"/home/me/a.txt","size":0,"modified":1,"mode":420,"hash":hash,"binary":false,"encoding":"utf8","content":""}}),
+        json!({"Stream":{"type":"file_content","request":"file-3","path":"/home/me/a.bin","size":1,"modified":1,"mode":420,"hash":hash,"binary":true,"encoding":"base64","content":"AA=="}}),
+        json!({"Stream":{"type":"file_written","request":"file-4","path":"/home/me/a.txt","hash":hash,"size":3,"modified":2,"created":true}}),
+        json!({"Stream":{"type":"file_removed","request":"file-5","removed":[{"path":"/home/me/old","trashed_as":"/home/me/.local/share/Trash/files/old"},{"path":"/home/me/gone"}],
+            "failed":[{"path":"/home/me/build","error":{"code":"permission_denied","message":"denied","path":"/home/me/build"}}]}}),
+        json!({"Stream":{"type":"file_error","request":"file-6","error":{"code":"conflict","message":"the file changed since it was read","path":"/home/me/a.txt","current_hash":hash}}}),
+        json!({"Stream":{"type":"file_error","request":"file-7","error":{"code":"too_large","message":"too large","size":99999999}}}),
+    ] {
+        assert!(client.accept(&event).is_ok(), "{event}");
+    }
+    for event in [
+        json!({"Stream":{"type":"file_list","request":"file 1","path":"/home/me","entries":[],"truncated":false,"skipped":0}}),
+        json!({"Stream":{"type":"file_list","request":"file-1","path":"home/me","entries":[],"truncated":false,"skipped":0}}),
+        json!({"Stream":{"type":"file_list","request":"file-1","path":"/home/me","entries":[{"name":"x","kind":"pipe","size":0,"modified":0,"mode":0}],"truncated":false,"skipped":0}}),
+        json!({"Stream":{"type":"file_list","request":"file-1","path":"/home/me","entries":[{"name":"","kind":"file","size":0,"modified":0,"mode":0}],"truncated":false,"skipped":0}}),
+        json!({"Stream":{"type":"file_list","request":"file-1","path":"/home/me","entries":[],"skipped":0}}),
+        json!({"Stream":{"type":"file_stat","request":"file-2","path":"/x","entry":{}}}),
+        json!({"Stream":{"type":"file_content","request":"file-3","path":"/a","size":0,"modified":1,"mode":420,"hash":"zz","binary":false,"encoding":"utf8","content":""}}),
+        json!({"Stream":{"type":"file_content","request":"file-3","path":"/a","size":0,"modified":1,"mode":420,"hash":hash,"binary":false,"encoding":"utf16","content":""}}),
+        json!({"Stream":{"type":"file_written","request":"file-4","path":"/a","hash":hash,"size":3,"modified":2}}),
+        json!({"Stream":{"type":"file_removed","request":"file-5","removed":[{"path":"relative"}],"failed":[]}}),
+        json!({"Stream":{"type":"file_removed","request":"file-5","removed":[],"failed":[{"path":"/a","error":{"code":"io"}}]}}),
+        json!({"Stream":{"type":"file_error","request":"file-6","error":{"code":"conflict","message":"x","current_hash":"nothex"}}}),
+        json!({"Stream":{"type":"file_error","request":"file-6"}}),
+    ] {
+        assert!(client.accept(&event).is_err(), "{event}");
+    }
+}
+
 // Binary screens (`binary-screens`): the same stream sent as JSON screens to
 // one client and as binary records to another leaves both with the same
 // screens, and the binary client's events carry the screens as JSON.

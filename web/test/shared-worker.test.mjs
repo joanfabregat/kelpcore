@@ -673,3 +673,76 @@ test("a window's binary-screens opt-in stays with the hosting connection", async
     0,
   );
 });
+
+test("file requests are relayed and each reply reaches only the window that asked", async () => {
+  const h = harness({ extra: { capabilities: ["files"] } });
+  const a = h.attach(),
+    b = h.attach();
+  await h.join(a);
+  await h.join(b);
+  const events = (view, type) =>
+    view.messages.filter((m) => m.event?.Stream?.type === type);
+  const host = (event) =>
+    h.send(a, { type: "host_event", event: { Stream: event } });
+  const sent = (type) => h.calls.filter((call) => call.type === type);
+  const request = (view, type, params) =>
+    h.send(view, { type: "request", request: type, params });
+
+  await request(b, "file_list", { request: "file-b-1", path: "~" });
+  await request(a, "file_mkdir", { request: "file-a-1", path: "/home/me/x" });
+  await request(a, "file_read", { request: "file-a-2", path: "/home/me/y" });
+  assert.equal(sent("file_list").length, 1);
+  assert.deepEqual(sent("file_list")[0].params, {
+    request: "file-b-1",
+    path: "~",
+  });
+  await host({
+    type: "file_list",
+    request: "file-b-1",
+    path: "/home/me",
+    entries: [],
+    truncated: false,
+    skipped: 0,
+  });
+  assert.equal(events(b, "file_list").length, 1);
+  assert.equal(events(a, "file_list").length, 0, "another window's reply");
+  await host({ type: "done", request: "file-a-1" });
+  assert.equal(events(a, "done").length, 1);
+  assert.equal(events(b, "done").length, 0);
+  // A refusal answers only its request and leaves pane claims alone.
+  await h.send(a, { type: "request", request: "claim", params: { pane: 1 } });
+  await host({ type: "error", request: "file-a-2", message: "bad request" });
+  assert.equal(events(a, "error").length, 1);
+  assert.equal(events(b, "error").length, 0);
+  await h.send(a, {
+    type: "request",
+    request: "input",
+    params: { pane: 1, bytes: [65] },
+  });
+  assert.equal(sent("input").length, 1, "the claim survived the file error");
+
+  // Identifiers are checked and cannot be reused while a reply is awaited.
+  const count = h.calls.length;
+  await request(a, "file_stat", { request: "bad id", path: "/" });
+  await request(a, "file_stat", { request: "file-a-3", path: "/" });
+  await request(b, "file_stat", { request: "file-a-3", path: "/" });
+  assert.equal(h.calls.length, count + 1);
+  assert.ok(
+    b.messages.some(
+      (m) => m.event?.Stream?.message === "Duplicate request identifier",
+    ),
+  );
+  // A window that leaves never gets its late reply broadcast to others.
+  const c = h.attach();
+  await h.join(c);
+  await request(c, "file_stat", { request: "file-c-1", path: "/" });
+  await h.send(c, { type: "leave" });
+  await host({
+    type: "file_stat",
+    request: "file-c-1",
+    path: "/",
+    entry: { name: "/", kind: "dir", size: 0, modified: 0, mode: 493 },
+  });
+  assert.equal(events(b, "file_stat").length, 0);
+  assert.equal(events(a, "file_stat").length, 0);
+});
