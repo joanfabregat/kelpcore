@@ -76,6 +76,11 @@ pub struct Notification {
     pub at: u64,
     pub read: bool,
     pub workspace: String,
+    /// A terminal bell accompanied this typed agent notification and was
+    /// merged into it (`bell-merge`): no separate bell record exists.
+    /// Omitted from the wire when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub bell: bool,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NotificationOrigin {

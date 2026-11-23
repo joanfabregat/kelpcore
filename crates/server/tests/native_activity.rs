@@ -1,7 +1,10 @@
 use kelpserver::{
     journal::RETENTION,
     model::{Kind, Status},
-    native::{activity::Activity, protocol::PaneInfo},
+    native::{
+        activity::{Activity, BELL_PAIR_WINDOW},
+        protocol::PaneInfo,
+    },
 };
 use std::{
     fs,
@@ -383,4 +386,195 @@ fn starting_an_agent_at_a_startup_dialog_does_not_notify() {
     let statuses: Vec<_> = activity.all().iter().map(|n| n.status).collect();
     assert_eq!(statuses.len(), 2);
     assert!(statuses.contains(&Status::InputNeeded) && statuses.contains(&Status::TurnFinished));
+}
+
+/// An agent known to the activity baseline, then working.
+fn working_agent(activity: &mut Activity, id: u64, time: u64) -> PaneInfo {
+    activity.observe(&[], time).unwrap();
+    let agent = pane(id, Status::Working);
+    activity
+        .observe(std::slice::from_ref(&agent), time)
+        .unwrap();
+    agent
+}
+
+#[test]
+fn a_bell_followed_by_a_typed_notification_becomes_one_marked_record() {
+    let fixture = Fixture::new();
+    let time = kelpserver::now();
+    let mut activity = Activity::load(&fixture.0, "test").unwrap();
+    let mut agent = working_agent(&mut activity, 1, time);
+    assert!(activity.bell(&agent, time + 1).unwrap());
+    let bell = activity.all()[0].id;
+    agent.status = Status::InputNeeded;
+    assert!(
+        activity
+            .observe(std::slice::from_ref(&agent), time + 1 + BELL_PAIR_WINDOW)
+            .unwrap()
+    );
+    let all = activity.all();
+    assert_eq!(all.len(), 1);
+    assert_eq!(all[0].status, Status::InputNeeded);
+    assert_eq!(all[0].title, "Agent 1");
+    assert!(all[0].bell && !all[0].read);
+    assert_ne!(all[0].id, bell, "a merged record is a new event");
+    // The merge persists.
+    drop(activity);
+    let restored = Activity::load(&fixture.0, "test").unwrap();
+    assert_eq!(restored.all().len(), 1);
+    assert!(restored.all()[0].bell);
+}
+
+#[test]
+fn a_bell_following_a_typed_notification_is_absorbed() {
+    let fixture = Fixture::new();
+    let time = kelpserver::now();
+    let mut activity = Activity::load(&fixture.0, "test").unwrap();
+    let mut agent = working_agent(&mut activity, 1, time);
+    agent.status = Status::TurnFinished;
+    assert!(
+        activity
+            .observe(std::slice::from_ref(&agent), time + 1)
+            .unwrap()
+    );
+    let id = activity.all()[0].id;
+    assert!(!activity.all()[0].bell);
+    assert!(!activity.bell(&agent, time + 1 + BELL_PAIR_WINDOW).unwrap());
+    // A second bell in the window changes nothing.
+    assert!(!activity.bell(&agent, time + 2).unwrap());
+    let all = activity.all();
+    assert_eq!(all.len(), 1);
+    assert_eq!((all[0].id, all[0].status), (id, Status::TurnFinished));
+    assert!(all[0].bell && !all[0].read);
+    drop(activity);
+    assert!(Activity::load(&fixture.0, "test").unwrap().all()[0].bell);
+}
+
+#[test]
+fn a_bell_alone_stays_a_bell_and_typed_notifications_stay_unmarked() {
+    let fixture = Fixture::new();
+    let time = kelpserver::now();
+    let mut activity = Activity::load(&fixture.0, "test").unwrap();
+    let mut first = working_agent(&mut activity, 1, time);
+    assert!(activity.bell(&first, time + 1).unwrap());
+    let all = activity.all();
+    assert_eq!(all.len(), 1);
+    assert_eq!(all[0].status, Status::Unknown);
+    assert_eq!(all[0].title, "Bell · Agent 1");
+    assert!(!all[0].bell);
+    // A typed notification without a bell is unmarked, and so is its
+    // serialization (old clients see exactly the previous wire format).
+    first.status = Status::Failed;
+    let mut second = pane(2, Status::Working);
+    activity
+        .observe(&[first.clone(), second.clone()], time + 10)
+        .unwrap();
+    second.status = Status::InputNeeded;
+    activity.observe(&[first, second], time + 20).unwrap();
+    let all = activity.all();
+    assert_eq!(all.len(), 3);
+    assert!(all.iter().all(|event| !event.bell));
+    let json = serde_json::to_value(&all[2]).unwrap();
+    assert!(json.get("bell").is_none());
+}
+
+#[test]
+fn a_bell_outside_the_window_stays_a_separate_record() {
+    let fixture = Fixture::new();
+    let time = kelpserver::now();
+    let mut activity = Activity::load(&fixture.0, "test").unwrap();
+    let mut agent = working_agent(&mut activity, 1, time);
+    assert!(activity.bell(&agent, time + 1).unwrap());
+    agent.status = Status::InputNeeded;
+    activity
+        .observe(std::slice::from_ref(&agent), time + 2 + BELL_PAIR_WINDOW)
+        .unwrap();
+    // And the other order: a bell after the typed notification's window.
+    assert!(
+        activity
+            .bell(&agent, time + 3 + 2 * BELL_PAIR_WINDOW)
+            .unwrap()
+    );
+    let statuses: Vec<_> = activity
+        .all()
+        .iter()
+        .map(|event| (event.status, event.bell))
+        .collect();
+    assert_eq!(
+        statuses,
+        [
+            (Status::Unknown, false),
+            (Status::InputNeeded, false),
+            (Status::Unknown, false)
+        ]
+    );
+}
+
+#[test]
+fn bells_of_another_pane_or_process_do_not_merge() {
+    let fixture = Fixture::new();
+    let time = kelpserver::now();
+    let mut activity = Activity::load(&fixture.0, "test").unwrap();
+    activity.observe(&[], time).unwrap();
+    let mut first = pane(1, Status::Working);
+    let second = pane(2, Status::Working);
+    activity
+        .observe(&[first.clone(), second.clone()], time)
+        .unwrap();
+    // Bell of pane 2, then a question of pane 1.
+    assert!(activity.bell(&second, time + 1).unwrap());
+    first.status = Status::InputNeeded;
+    activity
+        .observe(&[first.clone(), second.clone()], time + 1)
+        .unwrap();
+    // A question of pane 1, then a bell of pane 2 (outside the bell throttle).
+    assert!(activity.bell(&second, time + 3).unwrap());
+    // A new process in pane 1 rings right after the old one's question.
+    let mut replaced = first.clone();
+    replaced.pid += 1;
+    replaced.status = Status::Working;
+    activity
+        .observe(&[replaced.clone(), second], time + 3)
+        .unwrap();
+    let count = activity.all().len();
+    assert!(activity.bell(&replaced, time + 3).unwrap());
+    assert_eq!(activity.all().len(), count + 1);
+    assert!(activity.all().iter().all(|event| !event.bell));
+}
+
+#[test]
+fn acknowledging_a_merged_record_clears_the_bell_too() {
+    let fixture = Fixture::new();
+    let time = kelpserver::now();
+    let mut activity = Activity::load(&fixture.0, "test").unwrap();
+    let mut agent = working_agent(&mut activity, 1, time);
+    assert!(activity.bell(&agent, time + 1).unwrap());
+    let bell = activity.all()[0].id;
+    agent.status = Status::InputNeeded;
+    activity
+        .observe(std::slice::from_ref(&agent), time + 2)
+        .unwrap();
+    assert_eq!(activity.unread(), 1);
+    let merged = activity.all()[0].id;
+    activity.acknowledge(merged).unwrap();
+    assert_eq!(activity.unread(), 0);
+    // A client that saw only the bell acknowledges it after the merge: the
+    // merged record is the one it reaches.
+    agent.status = Status::Working;
+    activity
+        .observe(std::slice::from_ref(&agent), time + 10)
+        .unwrap();
+    assert!(activity.bell(&agent, time + 11).unwrap());
+    let bell2 = activity.all().last().unwrap().id;
+    agent.status = Status::TurnFinished;
+    activity
+        .observe(std::slice::from_ref(&agent), time + 12)
+        .unwrap();
+    assert_eq!(activity.unread(), 1);
+    activity.acknowledge(bell2).unwrap();
+    assert_eq!(activity.unread(), 0);
+    assert!(activity.all().iter().all(|event| event.bell));
+    assert!(activity.all().iter().all(|event| event.id != bell));
+    // Unknown identifiers still fail.
+    assert!(activity.acknowledge(u64::MAX).is_err());
 }

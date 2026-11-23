@@ -155,6 +155,7 @@ pub const CAPABILITIES: &[&str] = &[
     "uploads",
     "binary-screens",
     "files",
+    "bell-merge",
 ];
 /// Aggregate context budget of one multi-pane `search` reply.
 pub const MAX_SEARCH_CONTEXT: usize = 4 * 1024 * 1024;
