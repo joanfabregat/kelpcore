@@ -30,6 +30,8 @@ jobs:
       - run: cargo +1.99.0 clippy --workspace --locked --offline --all-targets -- -D warnings
       - run: cargo +1.99.0 build --locked --offline -p kelpserver --bin kelpserver
       - run: cargo +1.99.0 test --workspace --locked --offline -- --test-threads=2
+        # About a minute normally; a stuck test fails here, not at the job limit.
+        timeout-minutes: 10
   msrv:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
@@ -41,6 +43,8 @@ jobs:
       - run: cargo +1.85.0 fetch --locked
       - run: cargo +1.85.0 build --locked --offline -p kelpserver --bin kelpserver
       - run: cargo +1.85.0 test --workspace --locked --offline -- --test-threads=2
+        # About a minute normally; a stuck test fails here, not at the job limit.
+        timeout-minutes: 10
   wasm:
     name: Client core for browsers (WASM)
     runs-on: ubuntu-24.04

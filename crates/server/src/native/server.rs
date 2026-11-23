@@ -728,6 +728,15 @@ impl Client {
                     self.input.extend_from_slice(&buf[..n]);
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                // A client that closes with replies it never read resets the
+                // connection: Linux reports ECONNRESET after the last byte
+                // it sent. The requests read before the reset still count
+                // (a final `shutdown`, `close` or input); the connection
+                // closes once they are handled.
+                Err(_) if !messages.is_empty() => {
+                    self.closing = true;
+                    break;
+                }
                 Err(e) => return Err(e.into()),
             }
         }
@@ -2381,6 +2390,23 @@ impl Server {
         self.stream_frames(vitals, host);
         self.dirty = false;
     }
+    /// Handle the records a client sent before a write to it failed. A
+    /// client that sends a final request (`shutdown`, `close`, input) and
+    /// disconnects makes the next write fail, possibly before those records
+    /// were read; they must still count.
+    fn last_requests(&mut self, id: u64) {
+        let Some(client) = self.clients.get_mut(&id) else {
+            return;
+        };
+        let Ok(messages) = client.receive() else {
+            return;
+        };
+        for message in messages {
+            if self.message(id, message).is_err() {
+                break;
+            }
+        }
+    }
     fn remove_client(&mut self, id: u64) {
         if let Some(client) = self.clients.remove(&id) {
             // Replies held for it are dropped with their slots; operations
@@ -2665,6 +2691,7 @@ pub fn serve(config: ServerConfig) -> Result<()> {
         let ids: Vec<_> = server.clients.keys().copied().collect();
         for id in ids {
             if server.clients.get_mut(&id).unwrap().flush().is_err() {
+                server.last_requests(id);
                 server.remove_client(id);
             }
         }
