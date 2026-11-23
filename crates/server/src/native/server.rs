@@ -95,6 +95,9 @@ struct Download {
     next: Option<Vec<u8>>,
     /// `next` is the last event (done or error).
     finished: bool,
+    /// The last acknowledgement, or the last event taken into the output
+    /// queue (`downloads::STALL_TIMEOUT`).
+    progress: Instant,
 }
 #[derive(Default)]
 struct Downloads {
@@ -102,7 +105,45 @@ struct Downloads {
     next: u64,
     /// Download threads still running, cancelled ones included.
     threads: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// Threads of downloads that ended early (cancelled, failed by the
+    /// server or stalled), by connection, until they return: a connection
+    /// cannot cancel and restart downloads to run more threads than its
+    /// allowance.
+    stopping: Vec<(u64, super::downloads::Thread)>,
 }
+impl Downloads {
+    /// End a download: dropping it cancels its thread, which still counts
+    /// against its connection until it returns.
+    fn remove(&mut self, download: u64) {
+        if let Some(state) = self.active.remove(&download) {
+            let (client, thread) = (state.client, state.job.thread());
+            drop(state);
+            if thread.running() {
+                self.stopping.push((client, thread));
+            }
+        }
+    }
+    /// Downloads a connection holds: unfinished ones, and the threads of
+    /// those it ended that have not returned yet.
+    fn held_by(&mut self, client: u64) -> usize {
+        self.stopping.retain(|(_, thread)| thread.running());
+        self.active
+            .values()
+            .filter(|state| state.client == client)
+            .count()
+            + self.stopping.iter().filter(|(c, _)| *c == client).count()
+    }
+}
+/// Whether a download waiting for its client (a chunk unacknowledged or an
+/// event waiting for room) has made no progress for
+/// `downloads::STALL_TIMEOUT`.
+fn download_stalled(waiting: bool, progress: Instant, now: Instant) -> bool {
+    waiting && now.saturating_duration_since(progress) >= super::downloads::STALL_TIMEOUT
+}
+/// Download bytes a connection's output queue may hold: two framed chunks
+/// (base64 with room for the JSON fields). A screen update queued after
+/// them waits for at most that much, however many downloads run.
+const MAX_QUEUED_DOWNLOAD_BYTES: usize = 2 * (super::downloads::CHUNK_BYTES.div_ceil(3) * 4 + 1024);
 const MAX_CLIENTS: usize = 16;
 const MAX_QUEUED: usize = MAX_MESSAGE + 4;
 const MAX_PTY_WRITE: usize = 256 * 1024;
@@ -529,7 +570,10 @@ struct Client {
     socket: UnixStream,
     input: Vec<u8>,
     started: Option<Instant>,
-    output: VecDeque<Vec<u8>>,
+    /// Framed messages, each marked when it is a download event.
+    output: VecDeque<(Vec<u8>, bool)>,
+    /// Bytes of download events in `output`.
+    download_queued: usize,
     writing: Option<(Vec<u8>, usize)>,
     /// The one replaceable aggregate update.
     update: Option<Vec<u8>>,
@@ -605,6 +649,7 @@ impl Client {
             input: vec![],
             started: None,
             output: VecDeque::new(),
+            download_queued: 0,
             writing: None,
             update: None,
             queued: 0,
@@ -620,7 +665,7 @@ impl Client {
             return Err("slow native client".into());
         }
         self.queued += bytes.len();
-        self.output.push_back(bytes);
+        self.output.push_back((bytes, false));
         Ok(())
     }
     /// Hold a file reply until the output queue has room for it (see
@@ -652,18 +697,27 @@ impl Client {
             let (bytes, counted) = self.file_replies.pop_front().unwrap();
             released += usize::from(counted);
             self.queued += bytes.len();
-            self.output.push_back(bytes);
+            self.output.push_back((bytes, false));
         }
         released
     }
     /// Whether a download event of `len` bytes may enter the output queue:
     /// the room file replies leave for other messages, and never ahead of a
     /// pending screen update, which the queue's messages would otherwise
-    /// delay for as long as a download keeps refilling it.
+    /// delay for as long as a download keeps refilling it, and never more
+    /// than `MAX_QUEUED_DOWNLOAD_BYTES` of download events in all, so an
+    /// update that arrives after them waits for little.
     fn download_room(&self, len: usize) -> bool {
         self.update.is_none()
             && self.output.len() < MAX_OUTPUT_MESSAGES / 2
             && self.queued + len + FILE_REPLY_HEADROOM <= MAX_QUEUED
+            && self.download_queued + len <= MAX_QUEUED_DOWNLOAD_BYTES
+    }
+    /// Queue a download event (after `download_room`).
+    fn queue_download(&mut self, bytes: Vec<u8>) {
+        self.queued += bytes.len();
+        self.download_queued += bytes.len();
+        self.output.push_back((bytes, true));
     }
     /// Operation slots held by replies not yet in the output queue.
     fn held_slots(&self) -> usize {
@@ -682,11 +736,16 @@ impl Client {
         // Work per client is bounded so even a permanently writable observer cannot monopolize PTYs.
         for _ in 0..8 {
             if self.writing.is_none() {
-                self.writing = self
-                    .output
-                    .pop_front()
-                    .or_else(|| self.update.take())
-                    .map(|v| (v, 0));
+                self.writing = match self.output.pop_front() {
+                    Some((bytes, download)) => {
+                        if download {
+                            self.download_queued -= bytes.len();
+                        }
+                        Some(bytes)
+                    }
+                    None => self.update.take(),
+                }
+                .map(|v| (v, 0));
             }
             let Some((bytes, offset)) = &mut self.writing else {
                 break;
@@ -1503,7 +1562,7 @@ impl Server {
                     .get(&download)
                     .is_some_and(|state| state.client == id)
                 {
-                    self.downloads.active.remove(&download);
+                    self.downloads.remove(download);
                 }
                 return self.reply(id, Event::Done { request });
             }
@@ -1598,12 +1657,8 @@ impl Server {
             files::{self, Code, Error},
         };
         use std::sync::atomic::Ordering;
-        let mine = self
-            .downloads
-            .active
-            .values()
-            .filter(|state| state.client == id)
-            .count();
+        // Downloads it ended whose thread has not returned yet count too.
+        let mine = self.downloads.held_by(id);
         let threads = self.downloads.threads.load(Ordering::Relaxed);
         let refusal =
             if mine >= downloads::MAX_DOWNLOADS || threads >= downloads::MAX_SERVER_DOWNLOADS {
@@ -1631,6 +1686,7 @@ impl Server {
                                 started: false,
                                 next: None,
                                 finished: false,
+                                progress: Instant::now(),
                             },
                         );
                         return Ok(());
@@ -1659,6 +1715,7 @@ impl Server {
         if state.in_flight.front() == Some(&offset) {
             state.in_flight.pop_front();
             state.credits += 1;
+            state.progress = Instant::now();
             return;
         }
         let error = super::files::Error::new(
@@ -1674,7 +1731,7 @@ impl Server {
         state.next = wire(&ServerMessage::Stream(event)).ok();
         state.finished = true;
         if state.next.is_none() {
-            self.downloads.active.remove(&download);
+            self.downloads.remove(download);
         }
     }
     /// Move downloads forward: take the worker's pieces while the client has
@@ -1682,6 +1739,7 @@ impl Server {
     fn poll_downloads(&mut self) {
         use super::{downloads::Piece, stream::Event};
         use base64::{Engine, engine::general_purpose::STANDARD};
+        let now = Instant::now();
         let ids: Vec<u64> = self.downloads.active.keys().copied().collect();
         for download in ids {
             let state = self.downloads.active.get_mut(&download).unwrap();
@@ -1689,6 +1747,29 @@ impl Server {
                 self.downloads.active.remove(&download);
                 continue;
             };
+            let waiting = state.next.is_some() || !state.in_flight.is_empty();
+            if download_stalled(waiting, state.progress, now) {
+                // The client left the download behind: stop it, and tell
+                // the client if it ever reads again.
+                let event = Event::FileError {
+                    request: state.request.clone(),
+                    error: super::files::Error::new(
+                        super::files::Code::Io,
+                        format!(
+                            "no acknowledgement for {} seconds: the download was stopped",
+                            super::downloads::STALL_TIMEOUT.as_secs()
+                        ),
+                    ),
+                    download: state.started.then_some(download),
+                };
+                let id = state.client;
+                self.downloads.remove(download);
+                if client.hold_file_reply(event, false) {
+                    let released = client.pump_files();
+                    self.files.release(id, released);
+                }
+                continue;
+            }
             let mut remove = false;
             // Bounded work per connection and loop: a window's worth.
             for _ in 0..super::downloads::MAX_CHUNKS_IN_FLIGHT + 2 {
@@ -1697,8 +1778,8 @@ impl Server {
                         state.next = Some(bytes);
                         break;
                     }
-                    client.queued += bytes.len();
-                    client.output.push_back(bytes);
+                    client.queue_download(bytes);
+                    state.progress = now;
                     if state.finished {
                         remove = true;
                         break;
@@ -1787,7 +1868,7 @@ impl Server {
                 }
             }
             if remove {
-                self.downloads.active.remove(&download);
+                self.downloads.remove(download);
             }
         }
     }
@@ -3031,4 +3112,77 @@ pub fn serve(config: ServerConfig) -> Result<()> {
     }
     super::lifecycle::finish_run(&server.config.state_dir)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn download_events_queue_at_most_two_chunks_ahead_of_updates() {
+        let (socket, mut peer) = UnixStream::pair().unwrap();
+        let mut client = Client::new(socket).unwrap();
+        // A framed chunk as large as a download chunk gets.
+        let chunk = vec![b'x'; super::super::downloads::CHUNK_BYTES.div_ceil(3) * 4 + 200];
+        assert!(client.download_room(chunk.len()));
+        client.queue_download(chunk.clone());
+        assert!(client.download_room(chunk.len()));
+        client.queue_download(chunk.clone());
+        // A third waits, whatever the room left in the queue.
+        assert!(client.queued + chunk.len() + FILE_REPLY_HEADROOM <= MAX_QUEUED);
+        assert!(!client.download_room(chunk.len()));
+        assert!(!client.download_room(4096));
+        // Other messages are not download bytes.
+        client.send(ServerMessage::Error("other".into())).unwrap();
+        assert_eq!(client.download_queued, 2 * chunk.len());
+        // Once the first chunk is taken for writing, a chunk fits again.
+        peer.set_nonblocking(true).unwrap();
+        let mut sink = vec![0u8; 1 << 16];
+        while client.download_queued == 2 * chunk.len() {
+            client.flush().unwrap();
+            let _ = peer.read(&mut sink);
+        }
+        assert_eq!(client.download_queued, chunk.len());
+        assert!(client.download_room(chunk.len()));
+        // Never ahead of a pending screen update.
+        client.update = Some(vec![0; 8]);
+        assert!(!client.download_room(16));
+    }
+
+    #[test]
+    fn ended_downloads_count_against_their_connection_until_their_thread_returns() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        let mut downloads = Downloads::default();
+        let running = Arc::new(AtomicBool::new(true));
+        let thread = super::super::downloads::Thread::from_flag(running.clone());
+        downloads.stopping.push((1, thread.clone()));
+        downloads.stopping.push((1, thread));
+        assert_eq!(downloads.held_by(1), 2);
+        assert_eq!(downloads.held_by(2), 0);
+        running.store(false, Ordering::Release);
+        assert_eq!(downloads.held_by(1), 0);
+        assert!(downloads.stopping.is_empty());
+    }
+
+    #[test]
+    fn a_download_stalls_after_its_timeout_while_it_waits_for_its_client() {
+        let timeout = super::super::downloads::STALL_TIMEOUT;
+        assert_eq!(timeout, Duration::from_secs(600));
+        let start = Instant::now();
+        let later = start + timeout;
+        assert!(download_stalled(true, start, later));
+        assert!(!download_stalled(
+            true,
+            start,
+            later - Duration::from_secs(1)
+        ));
+        // A download waiting for its own thread (planning a large tree, or
+        // reading a slow disk) is not stalled.
+        assert!(!download_stalled(false, start, later + timeout));
+        // A progress reported after `now` (a racing acknowledgement).
+        assert!(!download_stalled(true, later, start));
+    }
 }

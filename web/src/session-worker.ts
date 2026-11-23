@@ -252,11 +252,15 @@ const downloadEventTypes = new Set([
   "file_download_done",
   "file_error",
 ]);
+/** Cancellations sent, by request: the download is forgotten once the
+ * server answers (nothing of it follows that answer). */
+const cancelling = new Map<string, number>();
 function cancelDownload(download: number) {
   downloads.set(download, undefined);
   if (!ssh) return;
   const request = `file-left-${++downloadSerial}`;
   correlated.set(request, undefined);
+  cancelling.set(request, download);
   ssh.request("file_download_cancel", { request, download });
 }
 /** Routes a started download's event; true when it was one. */
@@ -283,6 +287,7 @@ function downloadFrom(view: View, type: string, params: any) {
   }
   if (owner !== view) throw Error("Unknown download");
   correlatedFrom(view, type, params);
+  cancelling.set(params.request, params.download);
 }
 const correlated = new Map<string, View | undefined>();
 /** Bound on replies awaited across windows (the server runs at most a few
@@ -306,6 +311,10 @@ function correlatedEvent(value: any): boolean {
   if (typeof request !== "string" || !correlated.has(request)) return false;
   const view = correlated.get(request);
   correlated.delete(request);
+  if (cancelling.has(request)) {
+    downloads.delete(cancelling.get(request)!);
+    cancelling.delete(request);
+  }
   const e = value.Stream;
   if (e.type === "file_download_started" && typeof e.download === "number") {
     downloads.set(e.download, view);
@@ -342,6 +351,7 @@ function stop(message = "Signed out of all KelpMux windows.") {
   uploadRequests.clear();
   correlated.clear();
   downloads.clear();
+  cancelling.clear();
   batches.clear();
   queuedChunks.length = 0;
   chunksInFlight = 0;

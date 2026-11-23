@@ -325,7 +325,11 @@ type Download = {
 export type FilesClientOptions = {
   limits: FileLimits;
   /** How long to wait for a reply before giving up (default 120 s). The
-   * server cannot cancel a request, so its outcome is then unknown. */
+   * server cannot cancel a request, so its outcome is then unknown. A
+   * download's start is bounded the same way, so a call always settles; a
+   * download that starts after its call gave up is cancelled when its start
+   * arrives. Once started, a download fails after this long without an
+   * event while nothing is being written. */
   timeoutMs?: number;
   /** Retries of a request refused as `busy` (default 5). */
   busyRetries?: number;
@@ -335,6 +339,9 @@ export type FilesClientOptions = {
    * relay) cannot carry downloads, although the server sends them. */
   downloads?: boolean;
 };
+
+/** Begin requests given up on that are remembered (`abandoned`). */
+const MAX_ABANDONED = 64;
 
 function cancelledError() {
   return new FileError({ code: "cancelled", message: describeCode("cancelled") });
@@ -365,6 +372,11 @@ export class FilesClient {
   private retrying = new Set<Pending>();
   /** Started downloads, by the server's identifier. */
   private downloads = new Map<number, Download>();
+  /** Identifiers of `file_download_begin` requests given up on (their
+   * reply timed out), oldest first: a download that starts after all is
+   * cancelled at once rather than left to hold one of the connection's
+   * download slots until the server's stall timeout. */
+  private abandoned = new Set<string>();
   private stop: () => void;
   private closed = false;
 
@@ -678,6 +690,7 @@ export class FilesClient {
     for (const download of [...this.downloads.values()])
       download.fail(error());
     this.downloads.clear();
+    this.abandoned.clear();
     for (const pending of [
       ...this.running.values(),
       ...this.queue,
@@ -735,6 +748,7 @@ export class FilesClient {
     pending.timer = setTimeout(() => {
       if (this.running.get(id) !== pending) return;
       this.running.delete(id);
+      if (pending.type === "file_download_begin") this.abandon(id);
       pending.reject(
         new FileError({ code: "timeout", message: describeCode("timeout") }),
       );
@@ -755,6 +769,28 @@ export class FilesClient {
       this.pump();
     }
   }
+  /** Remember a begin request given up on, within a bound (the oldest is
+   * forgotten; its download, if it ever starts, ends at the server's stall
+   * timeout instead). */
+  private abandon(id: string) {
+    this.abandoned.add(id);
+    if (this.abandoned.size > MAX_ABANDONED)
+      this.abandoned.delete(this.abandoned.values().next().value!);
+  }
+  /** The reply to a begin request given up on: a download that started
+   * after all is cancelled at once. */
+  private orphan(e: any) {
+    if (e.type !== "file_download_started" || typeof e.download !== "number")
+      return;
+    try {
+      this.transport.send("file_download_cancel", {
+        request: requestId(),
+        download: e.download,
+      });
+    } catch {
+      // The connection is gone, and the download with it.
+    }
+  }
   private event(e: any) {
     // A started download's chunks, end and failure name the download.
     if (e && typeof e.download === "number") {
@@ -772,7 +808,10 @@ export class FilesClient {
     }
     if (!e || typeof e.request !== "string") return;
     const pending = this.running.get(e.request);
-    if (!pending) return;
+    if (!pending) {
+      if (this.abandoned.delete(e.request)) this.orphan(e);
+      return;
+    }
     let outcome: "resolve" | FileError;
     if (e.type === replies[pending.type]) outcome = "resolve";
     else if (e.type === "file_error")

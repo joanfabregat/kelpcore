@@ -109,6 +109,8 @@ function harness({ welcome = true, extra = {}, connection = {} } = {}) {
         }
     },
     tick: () => tick(),
+    /** Evaluates an expression in the worker's global scope. */
+    inspect: (expression) => vm.runInContext(expression, context),
   };
 }
 
@@ -817,4 +819,44 @@ test("a download's chunks reach only the window that began it", async () => {
   await host({ type: "file_download_chunk", download: 5, offset: 0, data: "YQ==" });
   assert.equal(events(a, "done").length, 0);
   assert.equal(events(a, "file_download_chunk").length, 0);
+});
+
+test("a cancelled download is forgotten once the server answers the cancel", async () => {
+  const h = harness({ extra: { capabilities: ["files", "file-downloads"] } });
+  const a = h.attach(),
+    b = h.attach();
+  await h.join(a);
+  await h.join(b);
+  const host = (event) =>
+    h.send(a, { type: "host_event", event: { Stream: event } });
+  const sent = (type) => h.calls.filter((call) => call.type === type);
+  const request = (view, type, params) =>
+    h.send(view, { type: "request", request: type, params });
+  const known = () => h.inspect("downloads.size");
+  const start = async (view, id, download) => {
+    await request(view, "file_download_begin", { request: id, paths: ["/home/me/big"] });
+    await host({ type: "file_download_started", request: id, download, name: "big" });
+  };
+
+  // Cancelled by the window that began it.
+  await start(b, "file-b-1", 4);
+  assert.equal(known(), 1);
+  await request(b, "file_download_cancel", { request: "file-b-2", download: 4 });
+  assert.equal(sent("file_download_cancel").length, 1);
+  assert.equal(known(), 1, "chunks sent before the cancel still reach it");
+  await host({ type: "done", request: "file-b-2" });
+  assert.equal(known(), 0);
+  assert.equal(h.inspect("cancelling.size"), 0);
+  await host({ type: "file_download_chunk", download: 4, offset: 0, data: "YQ==" });
+  assert.equal(b.messages.filter((m) => m.event?.Stream?.type === "file_download_chunk").length, 0);
+
+  // Cancelled by the worker for a window that left.
+  await start(b, "file-b-3", 5);
+  await h.send(b, { type: "leave" });
+  const cancel = sent("file_download_cancel").at(-1);
+  assert.equal(cancel.params.download, 5);
+  assert.equal(known(), 1);
+  await host({ type: "done", request: cancel.params.request });
+  assert.equal(known(), 0);
+  assert.equal(h.inspect("cancelling.size"), 0);
 });

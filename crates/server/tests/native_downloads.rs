@@ -783,6 +783,44 @@ fn a_cancelled_download_sends_nothing_more() {
 }
 
 #[test]
+fn cancelling_and_restarting_stays_within_the_allowance() {
+    let daemon = Daemon::start();
+    let mut peer = daemon.peer();
+    let path = daemon.work().join("big");
+    fs::write(&path, noise(4 * 1024 * 1024, 17)).unwrap();
+    for _ in 0..20 {
+        let mut started = Vec::new();
+        // A cancelled download's thread holds its slot until it returns,
+        // which it does promptly: the slot comes back.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while started.len() < downloads::MAX_DOWNLOADS {
+            match peer.begin(&[&path], None) {
+                Ok((download, _)) => started.push(download),
+                Err(error) if error.code == Code::Busy && Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("{error:?}"),
+            }
+        }
+        assert_eq!(peer.begin(&[&path], None).err().unwrap().code, Code::Busy);
+        for download in started {
+            peer.cancel(download);
+        }
+    }
+    // The connection's allowance is whole again.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match peer.download(&[&path], None) {
+            Ok(got) => break assert_eq!(got.bytes.len(), 4 * 1024 * 1024),
+            Err(error) if error.code == Code::Busy && Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(5));
+            }
+            Err(error) => panic!("{error:?}"),
+        }
+    }
+}
+
+#[test]
 fn a_disconnect_stops_its_downloads() {
     let daemon = Daemon::start();
     let path = daemon.work().join("big");

@@ -670,6 +670,48 @@ test("a download can fail, be refused or be cancelled", async () => {
   await assert.rejects(open, (e) => e.code === "closed");
 });
 
+test("a download that starts after its call timed out is cancelled at once", async () => {
+  const t = fakeTransport();
+  const client = new FilesClient(t.transport, {
+    limits: { ...limits, downloads: downloadLimits },
+    timeoutMs: 20,
+  });
+  const sink = { write() {} };
+  const late = client.download(["/home/me/big"], { sink, archive: "tar.gz" });
+  await tick();
+  const request = t.sent.at(-1).request;
+  await assert.rejects(late, (e) => e.code === "timeout");
+  // The server's planning walk finishes after all: the download is not
+  // left running, holding one of the connection's slots.
+  t.reply({ type: "file_download_started", request, download: 21, name: "big.tar.gz", archive: "tar.gz" });
+  const cancels = () => t.sent.filter((r) => r.type === "file_download_cancel");
+  assert.equal(cancels().length, 1);
+  assert.equal(cancels()[0].download, 21);
+  // Its chunks are dropped; a repeated start is not cancelled twice.
+  t.reply({ type: "file_download_chunk", download: 21, offset: 0, data: b64("abcd") });
+  t.reply({ type: "file_download_started", request, download: 21, name: "big.tar.gz" });
+  assert.equal(cancels().length, 1);
+  // A refusal that arrives late only clears the request.
+  const refused = client.download(["/home/me/big"], { sink });
+  await tick();
+  const second = t.sent.at(-1).request;
+  await assert.rejects(refused, (e) => e.code === "timeout");
+  t.reply({ type: "file_error", request: second, error: { code: "busy", message: "busy" } });
+  t.reply({ type: "file_download_started", request: second, download: 22, name: "big" });
+  assert.equal(cancels().length, 1);
+  // Aborted while starting, then timed out: cancelled too.
+  const abort = new AbortController();
+  const aborted = client.download(["/home/me/big"], { sink, signal: abort.signal });
+  await tick();
+  const third = t.sent.at(-1).request;
+  abort.abort();
+  await assert.rejects(aborted, (e) => e.code === "cancelled");
+  await new Promise((resolve) => setTimeout(resolve, 40));
+  t.reply({ type: "file_download_started", request: third, download: 23, name: "big" });
+  assert.equal(cancels().at(-1).download, 23);
+  client.close();
+});
+
 test("downloads are offered under the file's or the folder's name", () => {
   assert.equal(downloadName(["/home/me/a.txt"]), "a.txt");
   assert.equal(downloadName(["/home/me/src"], "tar.gz"), "src.tar.gz");

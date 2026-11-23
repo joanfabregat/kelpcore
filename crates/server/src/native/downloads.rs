@@ -15,8 +15,10 @@
 //! or FIFO); an archive walks its folders through directory descriptors
 //! opened with `O_NOFOLLOW`, stores symlinks as links without following
 //! them, opens each file with `O_NOFOLLOW`, never enters another file
-//! system, and skips devices, FIFOs and sockets. Depth, entry count and
-//! input bytes are bounded: an archive over a bound is refused with
+//! system (an opened folder must be the listed one, on the walk's device),
+//! and skips devices, FIFOs and sockets. Depth, entry count, input bytes,
+//! the names a walk lists and the names it holds are bounded, and a walk
+//! stops at its next name once cancelled: an archive over a bound is refused with
 //! `too_large` before its first byte when the planning walk sees it, and
 //! fails the same way if the tree grows past it while streaming.
 //!
@@ -59,6 +61,18 @@ pub const MAX_SERVER_DOWNLOADS: usize = 8;
 pub const MAX_ARCHIVE_ENTRIES: usize = 100_000;
 /// Most input bytes (the sum of the archived files' sizes) in one archive.
 pub const MAX_ARCHIVE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+/// Most names one walk of an archive lists (the planning walk and the
+/// archive walk count separately): its entries, but also the special files
+/// it skips and the names it could not examine, which the entry bound does
+/// not count. Like the scan bound of `file_list`, it bounds a walk's time.
+pub const MAX_ARCHIVE_SCAN: usize = 2 * MAX_ARCHIVE_ENTRIES;
+/// How long a download may wait for its client (no acknowledgement and no
+/// event taken into the client's output queue while a chunk is
+/// unacknowledged or an event waits for room) before the server stops it
+/// with an `io` error. A client that leaves a download behind (it gave up
+/// on the start, or stopped reading) cannot hold its slot and thread for
+/// longer than this.
+pub const STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 /// gzip level: miniz level 2 keeps one stream above gigabit rates on one
 /// core for most of the size gain of higher levels (measured by Crabinet,
 /// which streams ZIP archives the same way).
@@ -124,16 +138,36 @@ pub enum Piece {
 pub struct Job {
     pub receiver: mpsc::Receiver<Piece>,
     cancel: Arc<AtomicBool>,
+    alive: Thread,
+}
+impl Job {
+    /// The download's thread, which may outlive the job once cancelled.
+    pub fn thread(&self) -> Thread {
+        self.alive.clone()
+    }
 }
 impl Drop for Job {
     fn drop(&mut self) {
         self.cancel.store(true, Ordering::Relaxed);
     }
 }
+/// Whether a download's thread is still running.
+#[derive(Clone)]
+pub struct Thread(Arc<AtomicBool>);
+impl Thread {
+    pub fn running(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+    #[cfg(test)]
+    pub(super) fn from_flag(running: Arc<AtomicBool>) -> Self {
+        Self(running)
+    }
+}
 /// Counts a download thread from its start until it returns.
-struct Running(Arc<AtomicUsize>);
+struct Running(Arc<AtomicUsize>, Arc<AtomicBool>);
 impl Drop for Running {
     fn drop(&mut self) {
+        self.1.store(false, Ordering::Release);
         self.0.fetch_sub(1, Ordering::Relaxed);
     }
 }
@@ -147,8 +181,9 @@ pub fn start(
 ) -> io::Result<Job> {
     let (sender, receiver) = mpsc::sync_channel(AHEAD);
     let cancel = Arc::new(AtomicBool::new(false));
+    let alive = Arc::new(AtomicBool::new(true));
     threads.fetch_add(1, Ordering::Relaxed);
-    let running = Running(threads.clone());
+    let running = Running(threads.clone(), alive.clone());
     let flag = cancel.clone();
     std::thread::Builder::new()
         .name("kelpserver-download".into())
@@ -156,7 +191,11 @@ pub fn start(
             let _running = running;
             run(paths, archive, Output::new(sender, flag));
         })?;
-    Ok(Job { receiver, cancel })
+    Ok(Job {
+        receiver,
+        cancel,
+        alive: Thread(alive),
+    })
 }
 
 fn cancelled() -> io::Error {
@@ -277,13 +316,13 @@ fn download(paths: Vec<String>, archive: Option<Archive>, output: Output) -> Out
             Code::InvalidRequest,
             "several paths download only as an archive",
         )),
-        Some(Archive::TarGz) => tar_gz(&normalized, output),
+        Some(Archive::TarGz) => tar_gz(&normalized, output, BOUNDS),
     }
 }
 /// Map an output failure: a cancelled download, or an I/O error at `path`.
 fn output_error(error: io::Error, path: &Path) -> Error {
     if is_cancelled(&error) {
-        Error::new(Code::Io, "download cancelled")
+        cancelled_error()
     } else {
         files::io_error(error, path)
     }
@@ -361,17 +400,49 @@ struct Plan {
     entries: u64,
     bytes: u64,
 }
-fn too_many_entries(path: &Path) -> Error {
+/// The bounds of one archive; tests use smaller ones.
+#[derive(Debug, Clone, Copy)]
+struct Bounds {
+    /// Files, folders and symlinks archived.
+    entries: u64,
+    /// Input bytes: the sum of the archived files' sizes.
+    bytes: u64,
+    /// Names one walk lists.
+    scan: u64,
+    /// Names listed and not yet taken, across every open level of a walk:
+    /// what a walk holds in memory, whatever its depth.
+    held: u64,
+}
+const BOUNDS: Bounds = Bounds {
+    entries: MAX_ARCHIVE_ENTRIES as u64,
+    bytes: MAX_ARCHIVE_BYTES,
+    scan: MAX_ARCHIVE_SCAN as u64,
+    held: MAX_ARCHIVE_ENTRIES as u64,
+};
+fn too_many_entries(bounds: &Bounds, path: &Path) -> Error {
     Error::new(
         Code::TooLarge,
-        format!("the archive would hold more than {MAX_ARCHIVE_ENTRIES} entries"),
+        format!(
+            "the archive would hold more than {} entries",
+            bounds.entries
+        ),
     )
     .at(path)
 }
-fn too_many_bytes(path: &Path) -> Error {
+fn too_many_names(bounds: &Bounds, path: &Path) -> Error {
     Error::new(
         Code::TooLarge,
-        format!("the archive would read more than {MAX_ARCHIVE_BYTES} bytes"),
+        format!(
+            "the folders hold more than {} names (special files included)",
+            bounds.scan
+        ),
+    )
+    .at(path)
+}
+fn too_many_bytes(bounds: &Bounds, path: &Path) -> Error {
+    Error::new(
+        Code::TooLarge,
+        format!("the archive would read more than {} bytes", bounds.bytes),
     )
     .at(path)
 }
@@ -382,85 +453,114 @@ fn too_deep(path: &Path) -> Error {
     )
     .at(path)
 }
+fn cancelled_error() -> Error {
+    Error::new(Code::Io, "download cancelled")
+}
 fn is_denied(error: &io::Error) -> bool {
     matches!(error.raw_os_error(), Some(libc::EACCES | libc::EPERM))
 }
 fn is_gone(error: &io::Error) -> bool {
     matches!(error.raw_os_error(), Some(libc::ENOENT | libc::ENOTDIR))
 }
-/// A directory's names in byte order, refusing one with more than `room`.
-fn sorted_names(dir: RawFd, room: u64, path: &Path) -> Outcome<Vec<std::ffi::CString>> {
-    let limit = usize::try_from(room)
-        .unwrap_or(usize::MAX)
-        .saturating_add(1);
-    let (mut names, more) = files::names(dir, limit).map_err(|e| files::io_error(e, path))?;
-    if more || names.len() as u64 > room {
-        return Err(too_many_entries(path));
+/// One walk of the selected trees (the planning walk or the archive walk):
+/// its bounds, the download's cancel flag, the names it listed and the names
+/// it holds.
+struct Walk {
+    bounds: Bounds,
+    cancel: Arc<AtomicBool>,
+    scanned: u64,
+    held: u64,
+}
+impl Walk {
+    fn new(bounds: Bounds, cancel: Arc<AtomicBool>) -> Self {
+        Self {
+            bounds,
+            cancel,
+            scanned: 0,
+            held: 0,
+        }
     }
-    names.sort();
-    Ok(names)
+    /// A directory's names in byte order, refusing one that would pass the
+    /// entry bound (with `entries` counted so far), the held-names bound or
+    /// the scan bound. Each name is held until [`Walk::take`].
+    fn list(&mut self, dir: RawFd, entries: u64, path: &Path) -> Outcome<Vec<std::ffi::CString>> {
+        let entry_room = self
+            .bounds
+            .entries
+            .saturating_sub(entries)
+            .min(self.bounds.held.saturating_sub(self.held));
+        let scan_room = self.bounds.scan.saturating_sub(self.scanned);
+        let room = entry_room.min(scan_room);
+        let limit = usize::try_from(room)
+            .unwrap_or(usize::MAX)
+            .saturating_add(1);
+        let (mut names, more) = files::names(dir, limit).map_err(|e| files::io_error(e, path))?;
+        let listed = names.len() as u64;
+        if more || listed > room {
+            return Err(if scan_room < entry_room {
+                too_many_names(&self.bounds, path)
+            } else {
+                too_many_entries(&self.bounds, path)
+            });
+        }
+        self.scanned += listed;
+        self.held += listed;
+        names.sort();
+        Ok(names)
+    }
+    /// One listed name is taken for processing; stop if cancelled.
+    fn take(&mut self) -> Outcome<()> {
+        self.held = self.held.saturating_sub(1);
+        if self.cancel.load(Ordering::Relaxed) {
+            return Err(cancelled_error());
+        }
+        Ok(())
+    }
+}
+/// An entry's `lstat`, without triggering an automount.
+fn lstat_at(dir: RawFd, name: &CStr) -> io::Result<libc::stat> {
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    files::check(unsafe {
+        libc::fstatat(
+            dir,
+            name.as_ptr(),
+            &mut st,
+            libc::AT_SYMLINK_NOFOLLOW | libc::AT_NO_AUTOMOUNT,
+        )
+    })?;
+    Ok(st)
 }
 fn open_dir_at(dir: RawFd, name: &CStr) -> io::Result<OwnedFd> {
     files::open_at(dir, name, files::DIRECTORY | libc::O_NOFOLLOW, 0)
 }
-/// Count what an archive of a folder would hold, within the bounds.
-fn plan_tree(
-    dir: RawFd,
-    depth: usize,
-    dev: libc::dev_t,
-    path: &Path,
-    plan: &mut Plan,
-) -> Outcome<()> {
-    if depth > files::MAX_DEPTH {
-        return Err(too_deep(path));
-    }
-    let room = MAX_ARCHIVE_ENTRIES as u64 - plan.entries;
-    for name in sorted_names(dir, room, path)? {
-        let child = path.join(OsStr::from_bytes(name.to_bytes()));
-        let Ok(st) = files::stat_at(dir, &name) else {
-            continue;
-        };
-        plan_entry(dir, &name, &st, depth, dev, &child, plan)?;
-    }
-    Ok(())
+/// Whether a folder opened by name is the one its listing described, on
+/// the walk's file system: a mount point (whose `lstat` may describe the
+/// covered folder) or an entry replaced meanwhile is not entered.
+fn same_folder(listed: &libc::stat, opened: &libc::stat, dev: libc::dev_t) -> bool {
+    files::is_dir(opened)
+        && opened.st_dev == listed.st_dev
+        && opened.st_ino == listed.st_ino
+        && opened.st_dev == dev
 }
-fn plan_entry(
+/// Open a listed folder to walk it: `None` for a mount point or an entry
+/// that is no longer that folder.
+fn enter(
     dir: RawFd,
     name: &CStr,
-    st: &libc::stat,
-    depth: usize,
+    listed: &libc::stat,
     dev: libc::dev_t,
-    path: &Path,
-    plan: &mut Plan,
-) -> Outcome<()> {
-    let regular = files::is_regular(st);
-    if !(regular || files::is_dir(st) || files::is_symlink(st)) {
-        return Ok(());
-    }
-    plan.entries += 1;
-    if plan.entries > MAX_ARCHIVE_ENTRIES as u64 {
-        return Err(too_many_entries(path));
-    }
-    if regular {
-        plan.bytes += st.st_size as u64;
-        if plan.bytes > MAX_ARCHIVE_BYTES {
-            return Err(too_many_bytes(path));
-        }
-    } else if files::is_dir(st) && st.st_dev == dev {
-        if let Ok(child) = open_dir_at(dir, name) {
-            plan_tree(child.as_raw_fd(), depth + 1, dev, path, plan)?;
-        }
-    }
-    Ok(())
+) -> io::Result<Option<OwnedFd>> {
+    let child = open_dir_at(dir, name)?;
+    let opened = files::stat_fd(child.as_raw_fd())?;
+    Ok(same_folder(listed, &opened, dev).then_some(child))
 }
-
-/// Files and folders as one gzip-compressed tar archive.
-fn tar_gz(paths: &[PathBuf], mut output: Output) -> Outcome<Piece> {
+/// The selected entries, checked.
+fn roots(paths: &[PathBuf]) -> Outcome<Vec<Root>> {
     let mut roots = Vec::with_capacity(paths.len());
     let mut names = std::collections::BTreeSet::new();
     for path in paths {
         let location = files::locate(path)?;
-        let st = files::stat_at(location.dir.as_raw_fd(), &location.name)
+        let st = lstat_at(location.dir.as_raw_fd(), &location.name)
             .map_err(|e| files::io_error(e, path))?;
         if !names.insert(location.name.clone()) {
             return Err(Error::new(
@@ -478,8 +578,13 @@ fn tar_gz(paths: &[PathBuf], mut output: Output) -> Outcome<Piece> {
             st,
         });
     }
+    Ok(roots)
+}
+/// Count what an archive of the selected entries would hold, within the
+/// bounds.
+fn plan(roots: &[Root], walk: &mut Walk) -> Outcome<Plan> {
     let mut plan = Plan::default();
-    for root in &roots {
+    for root in roots {
         plan_entry(
             root.location.dir.as_raw_fd(),
             &root.location.name,
@@ -488,8 +593,68 @@ fn tar_gz(paths: &[PathBuf], mut output: Output) -> Outcome<Piece> {
             root.st.st_dev,
             &root.path,
             &mut plan,
+            walk,
         )?;
     }
+    Ok(plan)
+}
+fn plan_tree(
+    dir: RawFd,
+    depth: usize,
+    dev: libc::dev_t,
+    path: &Path,
+    plan: &mut Plan,
+    walk: &mut Walk,
+) -> Outcome<()> {
+    if depth > files::MAX_DEPTH {
+        return Err(too_deep(path));
+    }
+    for name in walk.list(dir, plan.entries, path)? {
+        walk.take()?;
+        let child = path.join(OsStr::from_bytes(name.to_bytes()));
+        let Ok(st) = lstat_at(dir, &name) else {
+            continue;
+        };
+        plan_entry(dir, &name, &st, depth, dev, &child, plan, walk)?;
+    }
+    Ok(())
+}
+#[allow(clippy::too_many_arguments)]
+fn plan_entry(
+    dir: RawFd,
+    name: &CStr,
+    st: &libc::stat,
+    depth: usize,
+    dev: libc::dev_t,
+    path: &Path,
+    plan: &mut Plan,
+    walk: &mut Walk,
+) -> Outcome<()> {
+    let regular = files::is_regular(st);
+    if !(regular || files::is_dir(st) || files::is_symlink(st)) {
+        return Ok(());
+    }
+    plan.entries += 1;
+    if plan.entries > walk.bounds.entries {
+        return Err(too_many_entries(&walk.bounds, path));
+    }
+    if regular {
+        plan.bytes += st.st_size as u64;
+        if plan.bytes > walk.bounds.bytes {
+            return Err(too_many_bytes(&walk.bounds, path));
+        }
+    } else if files::is_dir(st) && st.st_dev == dev {
+        if let Ok(Some(child)) = enter(dir, name, st, dev) {
+            plan_tree(child.as_raw_fd(), depth + 1, dev, path, plan, walk)?;
+        }
+    }
+    Ok(())
+}
+
+/// Files and folders as one gzip-compressed tar archive.
+fn tar_gz(paths: &[PathBuf], mut output: Output, bounds: Bounds) -> Outcome<Piece> {
+    let roots = roots(paths)?;
+    let plan = plan(&roots, &mut Walk::new(bounds, output.cancel.clone()))?;
     let name = match &roots[..] {
         [root] => format!("{}.tar.gz", name_text(&root.path)),
         _ => {
@@ -515,8 +680,10 @@ fn tar_gz(paths: &[PathBuf], mut output: Output) -> Outcome<Piece> {
             input_bytes: Some(plan.bytes),
         })
         .map_err(|e| output_error(e, first))?;
+    let walk = Walk::new(bounds, output.cancel.clone());
     let mut tar = Tar {
         out: GzEncoder::new(output, Compression::new(LEVEL)),
+        walk,
         input,
         entries: 0,
         bytes: 0,
@@ -558,6 +725,7 @@ fn tar_gz(paths: &[PathBuf], mut output: Output) -> Outcome<Piece> {
 
 struct Tar {
     out: GzEncoder<Output>,
+    walk: Walk,
     input: Arc<AtomicU64>,
     entries: u64,
     bytes: u64,
@@ -574,8 +742,8 @@ impl Tar {
     }
     fn count(&mut self, path: &Path) -> Outcome<()> {
         self.entries += 1;
-        if self.entries > MAX_ARCHIVE_ENTRIES as u64 {
-            return Err(too_many_entries(path));
+        if self.entries > self.walk.bounds.entries {
+            return Err(too_many_entries(&self.walk.bounds, path));
         }
         Ok(())
     }
@@ -618,8 +786,14 @@ impl Tar {
                 self.skipped += 1;
                 return Ok(());
             }
-            let child = match open_dir_at(dir, name) {
-                Ok(child) => child,
+            let child = match enter(dir, name, st, dev) {
+                Ok(Some(child)) => child,
+                // A mount point whose `lstat` described the covered folder,
+                // or a folder replaced since it was listed: stored empty.
+                Ok(None) => {
+                    self.skipped += 1;
+                    return Ok(());
+                }
                 Err(error) if is_denied(&error) => {
                     self.skipped += 1;
                     return Ok(());
@@ -663,10 +837,10 @@ impl Tar {
         if depth > files::MAX_DEPTH {
             return Err(too_deep(path));
         }
-        let room = MAX_ARCHIVE_ENTRIES as u64 - self.entries;
-        for name in sorted_names(dir, room, path)? {
+        for name in self.walk.list(dir, self.entries, path)? {
+            self.walk.take()?;
             let child = path.join(OsStr::from_bytes(name.to_bytes()));
-            let st = match files::stat_at(dir, &name) {
+            let st = match lstat_at(dir, &name) {
                 Ok(st) => st,
                 Err(error) if is_gone(&error) => continue,
                 Err(error) if is_denied(&error) => {
@@ -713,8 +887,8 @@ impl Tar {
         self.count(path)?;
         let size = st.st_size as u64;
         self.bytes += size;
-        if self.bytes > MAX_ARCHIVE_BYTES {
-            return Err(too_many_bytes(path));
+        if self.bytes > self.walk.bounds.bytes {
+            return Err(too_many_bytes(&self.walk.bounds, path));
         }
         self.header(
             Header {
@@ -792,15 +966,24 @@ impl Header<'_> {
     /// The ustar header block, preceded by a pax extended header (and its
     /// records) when a field does not fit ustar.
     fn encode(&self, out: &mut Vec<u8>) {
-        let plain =
-            |bytes: &[u8]| bytes.len() <= 100 && bytes.iter().all(|b| (0x20..0x7f).contains(b));
+        let plain = |bytes: &[u8]| bytes.len() <= NAME_FIELD && bytes.iter().all(|&b| printable(b));
         let mut records = Vec::new();
-        if !plain(self.name) {
+        // Pax values are UTF-8 unless the header says otherwise.
+        if std::str::from_utf8(self.name).is_err() || std::str::from_utf8(self.link).is_err() {
+            pax_record(&mut records, b"hdrcharset", b"BINARY");
+        }
+        let (name, prefix) = if plain(self.name) {
+            (self.name.to_vec(), Vec::new())
+        } else {
             pax_record(&mut records, b"path", self.name);
-        }
-        if !plain(self.link) {
+            fallback(self.name, NAME_FIELD, PREFIX_FIELD)
+        };
+        let link = if plain(self.link) {
+            self.link.to_vec()
+        } else {
             pax_record(&mut records, b"linkpath", self.link);
-        }
+            fallback(self.link, NAME_FIELD, 0).0
+        };
         if self.size > OCTAL_MAX {
             pax_record(&mut records, b"size", self.size.to_string().as_bytes());
         }
@@ -811,11 +994,13 @@ impl Header<'_> {
             pax_record(&mut records, b"mtime", self.mtime.to_string().as_bytes());
         }
         if !records.is_empty() {
-            let mut name = b"PaxHeader/".to_vec();
-            name.extend_from_slice(&fallback(self.name, 100 - name.len()));
+            let mut pax = b"PaxHeader/".to_vec();
+            let room = NAME_FIELD - pax.len();
+            pax.extend_from_slice(&fallback(self.name, room, 0).0);
             block(
                 out,
-                &name,
+                &pax,
+                b"",
                 b'x',
                 0o644,
                 records.len() as u64,
@@ -827,12 +1012,13 @@ impl Header<'_> {
         }
         block(
             out,
-            &fallback(self.name, 100),
+            &name,
+            &prefix,
             self.kind,
             self.mode,
             if self.size > OCTAL_MAX { 0 } else { self.size },
             mtime.unwrap_or(0),
-            &fallback(self.link, 100),
+            &link,
         );
     }
 }
@@ -850,17 +1036,83 @@ fn pax_record(out: &mut Vec<u8>, key: &[u8], value: &[u8]) {
     out.extend_from_slice(value);
     out.push(b'\n');
 }
-/// A ustar field value for a name that needs a pax record: printable ASCII
-/// (others as `_`), its last `max` bytes. Readers use the pax record.
-fn fallback(name: &[u8], max: usize) -> Vec<u8> {
-    let start = name.len().saturating_sub(max);
-    name[start..]
+/// The ustar `name` and `linkname` fields' size.
+const NAME_FIELD: usize = 100;
+/// The ustar `prefix` field's size.
+const PREFIX_FIELD: usize = 155;
+fn printable(b: u8) -> bool {
+    (0x20..0x7f).contains(&b)
+}
+/// A path's components as a relative path: printable ASCII only (others as
+/// `_`), without empty, `.` or `..` components, so never absolute; a
+/// trailing `/` (a folder) is kept.
+fn relative(path: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(path.len());
+    for part in path.split(|&b| b == b'/') {
+        if part.is_empty() || part == b"." || part == b".." {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push(b'/');
+        }
+        out.extend(part.iter().map(|&b| if printable(b) { b } else { b'_' }));
+    }
+    if path.ends_with(b"/") && !out.is_empty() {
+        out.push(b'/');
+    }
+    out
+}
+/// The ustar `(name, prefix)` fields of a path that also has a pax record,
+/// for readers that ignore pax (those that know it use the record). The
+/// value is never absolute, has no `.` or `..` component and is never
+/// empty: the whole path split on a `/` into `prefix` (at most
+/// `prefix_max` bytes) and `name` (at most `max`) when it fits, otherwise
+/// the last components that fit `max` bytes (the end of the last component
+/// when it alone is longer), with an empty prefix.
+fn fallback(path: &[u8], max: usize, prefix_max: usize) -> (Vec<u8>, Vec<u8>) {
+    let path = relative(path);
+    if path.len() <= max {
+        return (non_empty(path), Vec::new());
+    }
+    // A split on a `/` that leaves a name (not the trailing `/` of a folder).
+    let split = path[..path.len() - 1]
         .iter()
-        .map(|&b| if (0x20..0x7f).contains(&b) { b } else { b'_' })
-        .collect()
+        .enumerate()
+        .filter(|&(_, &b)| b == b'/')
+        .map(|(at, _)| at)
+        .find(|&at| at <= prefix_max && path.len() - at - 1 <= max);
+    if let Some(at) = split {
+        return (path[at + 1..].to_vec(), path[..at].to_vec());
+    }
+    // The last components that fit, starting after a `/`.
+    let tail = (path.len() - max..path.len() - 1)
+        .find(|&at| path[at - 1] == b'/')
+        .map(|at| path[at..].to_vec());
+    let name = match tail {
+        Some(tail) => tail,
+        None => relative(&path[path.len() - max..]),
+    };
+    (non_empty(name), Vec::new())
+}
+fn non_empty(name: Vec<u8>) -> Vec<u8> {
+    if name.is_empty() || name == b"/" {
+        b"_".to_vec()
+    } else {
+        name
+    }
 }
 /// One ustar header block.
-fn block(out: &mut Vec<u8>, name: &[u8], kind: u8, mode: u32, size: u64, mtime: u64, link: &[u8]) {
+#[allow(clippy::too_many_arguments)]
+fn block(
+    out: &mut Vec<u8>,
+    name: &[u8],
+    prefix: &[u8],
+    kind: u8,
+    mode: u32,
+    size: u64,
+    mtime: u64,
+    link: &[u8],
+) {
     let mut header = [0u8; BLOCK];
     header[..name.len()].copy_from_slice(name);
     octal(&mut header[100..108], u64::from(mode));
@@ -872,6 +1124,7 @@ fn block(out: &mut Vec<u8>, name: &[u8], kind: u8, mode: u32, size: u64, mtime: 
     header[157..157 + link.len()].copy_from_slice(link);
     header[257..263].copy_from_slice(b"ustar\0");
     header[263..265].copy_from_slice(b"00");
+    header[345..345 + prefix.len()].copy_from_slice(prefix);
     // The checksum counts its own field as eight spaces.
     header[148..156].copy_from_slice(b"        ");
     let sum: u32 = header.iter().map(|&b| u32::from(b)).sum();
@@ -948,5 +1201,261 @@ mod tests {
         assert_eq!(&field, b"00000000005\0");
         octal(&mut field, OCTAL_MAX);
         assert_eq!(&field, b"77777777777\0");
+    }
+    /// A field's bytes up to its first NUL.
+    fn field(block: &[u8], range: std::ops::Range<usize>) -> &[u8] {
+        let bytes = &block[range];
+        &bytes[..bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len())]
+    }
+    /// What a reader that ignores pax would extract: `prefix/name`.
+    fn ustar_path(block: &[u8]) -> Vec<u8> {
+        let (name, prefix) = (field(block, 0..100), field(block, 345..500));
+        if prefix.is_empty() {
+            name.to_vec()
+        } else {
+            [prefix, b"/", name].concat()
+        }
+    }
+    fn assert_safe(value: &[u8], what: &str) {
+        assert!(!value.is_empty(), "{what} is empty");
+        assert!(!value.starts_with(b"/"), "{what} is absolute: {value:?}");
+        for part in value.split(|&b| b == b'/') {
+            assert!(
+                part != b".." && part != b".",
+                "{what} has a dot component: {:?}",
+                String::from_utf8_lossy(value)
+            );
+        }
+        assert!(value.iter().all(|&b| printable(b)), "{what} is not ASCII");
+    }
+    #[test]
+    fn ustar_fallback_names_are_relative_without_dot_components() {
+        let long = |head: &[u8], tail: usize| {
+            let mut name = head.to_vec();
+            name.extend(std::iter::repeat_n(b'z', tail));
+            name
+        };
+        let mut names = vec![
+            // The last 100 bytes would start with `../`.
+            long(b"r/x../", 97),
+            // The last 100 bytes would start with `/`, with a short and a
+            // long middle component (no `prefix` split fits the latter).
+            [b"r/".as_slice(), &[b'q'; 40], b"/", &[b'y'; 99]].concat(),
+            [b"r/".as_slice(), &[b'q'; 200], b"/", &[b'y'; 99]].concat(),
+            [b"r/".as_slice(), &[b'q'; 200], b"/", &[b'y'; 99], b"/"].concat(),
+            // One component longer than the name field.
+            [b"r/".as_slice(), &[b'.'; 200]].concat(),
+            [b"r/".as_slice(), &[b'.'; 101], b"/"].concat(),
+            // Not UTF-8, and dots after a component boundary.
+            [b"r/\xff\xfe/".as_slice(), &[b'.'; 2], b"/", &[b'w'; 120]].concat(),
+        ];
+        names.push(long(b"", 300));
+        for name in &names {
+            for link in [b"".as_slice(), name] {
+                let mut out = Vec::new();
+                Header {
+                    name,
+                    kind: if link.is_empty() { b'0' } else { b'2' },
+                    mode: 0o644,
+                    size: 0,
+                    mtime: 0,
+                    link,
+                }
+                .encode(&mut out);
+                let blocks: Vec<&[u8]> = out.chunks(BLOCK).collect();
+                let (pax, header) = (blocks[0], blocks[blocks.len() - 1]);
+                assert_eq!(pax[156], b'x');
+                let pax_name = field(pax, 0..100);
+                assert!(pax_name.starts_with(b"PaxHeader/"));
+                assert_safe(&pax_name[b"PaxHeader/".len()..], "the pax header's name");
+                assert_safe(field(header, 0..100), "the name field");
+                let prefix = field(header, 345..500);
+                if !prefix.is_empty() {
+                    assert_safe(prefix, "the prefix field");
+                }
+                assert_safe(&ustar_path(header), "the ustar path");
+                if !link.is_empty() {
+                    assert_safe(field(header, 157..257), "the link field");
+                }
+                // The pax record keeps the exact name.
+                let records = &out[BLOCK..out.len() - BLOCK];
+                let mut record = b"path=".to_vec();
+                record.extend_from_slice(name);
+                record.push(b'\n');
+                assert!(records.windows(record.len()).any(|w| w == record));
+                // Non-UTF-8 values are flagged as binary.
+                let binary = std::str::from_utf8(name).is_err();
+                let flag = b"hdrcharset=BINARY\n";
+                assert_eq!(records.windows(flag.len()).any(|w| w == flag), binary);
+            }
+        }
+        // A path that fits `prefix` + `name` is split on a `/` and complete.
+        let name = [b"r/".as_slice(), &[b'q'; 40], b"/", &[b'y'; 99]].concat();
+        let mut out = Vec::new();
+        Header {
+            name: &name,
+            kind: b'0',
+            mode: 0o644,
+            size: 0,
+            mtime: 0,
+            link: b"",
+        }
+        .encode(&mut out);
+        assert_eq!(ustar_path(&out[out.len() - BLOCK..]), name);
+        let name = long(b"r/x../", 97);
+        assert_eq!(
+            fallback(&name, 100, 155),
+            (vec![b'z'; 97], b"r/x..".to_vec())
+        );
+        assert_eq!(fallback(b"/../..", 100, 155).0, b"_");
+    }
+
+    /// A fresh folder for a test.
+    fn scratch(test: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "kelpserver-downloads-unit-{}-{test}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+    fn small(scan: u64, held: u64) -> Bounds {
+        Bounds {
+            entries: 1000,
+            bytes: 1 << 20,
+            scan,
+            held,
+        }
+    }
+    fn plan_of(path: &Path, bounds: Bounds, cancelled: bool) -> (Outcome<Plan>, Walk) {
+        let roots = roots(&[path.to_owned()]).unwrap();
+        let mut walk = Walk::new(bounds, Arc::new(AtomicBool::new(cancelled)));
+        (plan(&roots, &mut walk), walk)
+    }
+    fn mkfifo(path: &Path) {
+        let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+    }
+    #[test]
+    fn a_cancelled_walk_stops_at_its_next_name() {
+        let root = scratch("cancel");
+        for dir in ["a", "b", "c"] {
+            std::fs::create_dir(root.join(dir)).unwrap();
+            for file in 0..50 {
+                std::fs::write(root.join(dir).join(file.to_string()), "x").unwrap();
+            }
+        }
+        let (result, walk) = plan_of(&root, BOUNDS, false);
+        assert_eq!(result.unwrap().entries, 1 + 3 + 150);
+        assert_eq!(walk.scanned, 3 + 150);
+        assert_eq!(walk.held, 0);
+        // Cancelled: the walk lists the top folder, then stops before its
+        // first name, without entering a folder.
+        let (result, walk) = plan_of(&root, BOUNDS, true);
+        let error = result.err().unwrap();
+        assert_eq!(error.message, "download cancelled");
+        assert_eq!(walk.scanned, 3);
+        // The archive walk stops the same way.
+        let (sender, _receiver) = mpsc::sync_channel(AHEAD);
+        let flag = Arc::new(AtomicBool::new(false));
+        let output = Output::new(sender, flag.clone());
+        let mut tar = Tar {
+            out: GzEncoder::new(output, Compression::new(LEVEL)),
+            walk: Walk::new(BOUNDS, flag.clone()),
+            input: Default::default(),
+            entries: 0,
+            bytes: 0,
+            skipped: 0,
+            changed: 0,
+            buffer: vec![0u8; 16],
+        };
+        let dir = files::open_at(
+            libc::AT_FDCWD,
+            &files::cstring(root.as_os_str().as_bytes()).unwrap(),
+            files::DIRECTORY,
+            0,
+        )
+        .unwrap();
+        flag.store(true, Ordering::Relaxed);
+        let error = tar
+            .tree(
+                dir.as_raw_fd(),
+                b"r/",
+                1,
+                lstat_at(dir.as_raw_fd(), c".").unwrap().st_dev,
+                &root,
+            )
+            .err()
+            .unwrap();
+        assert_eq!(error.message, "download cancelled");
+        assert_eq!((tar.walk.scanned, tar.entries), (3, 0));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+    #[test]
+    fn special_files_count_against_the_scan_budget() {
+        let root = scratch("fifos");
+        for n in 0..50 {
+            mkfifo(&root.join(format!("fifo{n}")));
+        }
+        // FIFOs are no entries: the entry bound alone would let any number
+        // through.
+        let (result, _) = plan_of(&root, small(1000, 1000), false);
+        assert_eq!(result.unwrap().entries, 1);
+        let (result, walk) = plan_of(&root, small(20, 1000), false);
+        let error = result.err().unwrap();
+        assert_eq!(error.code, Code::TooLarge);
+        assert!(error.message.contains("names"), "{}", error.message);
+        assert!(walk.scanned <= 20);
+        // Across folders, too.
+        std::fs::create_dir(root.join("sub")).unwrap();
+        for n in 0..30 {
+            mkfifo(&root.join(format!("sub/fifo{n}")));
+        }
+        let (result, _) = plan_of(&root, small(60, 1000), false);
+        assert_eq!(result.err().unwrap().code, Code::TooLarge);
+        let (result, walk) = plan_of(&root, small(81, 1000), false);
+        assert_eq!(result.unwrap().entries, 2);
+        assert_eq!(walk.scanned, 81);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+    #[test]
+    fn names_held_across_open_folders_are_bounded() {
+        let root = scratch("held");
+        // `a` is walked first, while the top folder still holds five names.
+        std::fs::create_dir(root.join("a")).unwrap();
+        for n in 0..5 {
+            std::fs::write(root.join(format!("f{n}")), "x").unwrap();
+            std::fs::write(root.join(format!("a/g{n}")), "x").unwrap();
+        }
+        let (result, walk) = plan_of(&root, small(1000, 10), false);
+        assert_eq!(result.unwrap().entries, 1 + 6 + 5);
+        assert_eq!(walk.held, 0);
+        std::fs::write(root.join("a/g5"), "x").unwrap();
+        let (result, _) = plan_of(&root, small(1000, 10), false);
+        let error = result.err().unwrap();
+        assert_eq!(error.code, Code::TooLarge);
+        assert!(error.message.contains("entries"), "{}", error.message);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+    #[test]
+    fn only_the_listed_folder_on_the_same_file_system_is_entered() {
+        let mut listed: libc::stat = unsafe { std::mem::zeroed() };
+        listed.st_mode = libc::S_IFDIR | 0o755;
+        listed.st_dev = 7;
+        listed.st_ino = 42;
+        assert!(same_folder(&listed, &listed, 7));
+        // Another file system (a mount point), or the walk's root elsewhere.
+        let mut opened = listed;
+        opened.st_dev = 8;
+        assert!(!same_folder(&listed, &opened, 7));
+        assert!(!same_folder(&listed, &listed, 8));
+        // Another folder (replaced after the listing).
+        let mut opened = listed;
+        opened.st_ino = 43;
+        assert!(!same_folder(&listed, &opened, 7));
+        let mut opened = listed;
+        opened.st_mode = libc::S_IFREG | 0o644;
+        assert!(!same_folder(&listed, &opened, 7));
     }
 }
