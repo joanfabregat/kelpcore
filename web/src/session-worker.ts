@@ -229,6 +229,8 @@ const correlatedTypes = new Set([
   "file_rename",
   "file_trash",
   "file_delete",
+  "file_download_begin",
+  "file_download_cancel",
 ]);
 /** Requests that change something: they count as user activity. */
 const deliberateTypes = new Set([
@@ -237,7 +239,56 @@ const deliberateTypes = new Set([
   "file_rename",
   "file_trash",
   "file_delete",
+  "file_download_begin",
 ]);
+/** Downloads (`file-downloads`) by the server's identifier, with the window
+ * that began them (`undefined` once it left: the download is being
+ * cancelled and its late events are dropped). Its chunks, end and failure
+ * name the download, not a request. */
+const downloads = new Map<number, View | undefined>();
+let downloadSerial = 0;
+const downloadEventTypes = new Set([
+  "file_download_chunk",
+  "file_download_done",
+  "file_error",
+]);
+/** Cancellations sent, by request: the download is forgotten once the
+ * server answers (nothing of it follows that answer). */
+const cancelling = new Map<string, number>();
+function cancelDownload(download: number) {
+  downloads.set(download, undefined);
+  if (!ssh) return;
+  const request = `file-left-${++downloadSerial}`;
+  correlated.set(request, undefined);
+  cancelling.set(request, download);
+  ssh.request("file_download_cancel", { request, download });
+}
+/** Routes a started download's event; true when it was one. */
+function downloadEvent(value: any): boolean {
+  const e = value.Stream;
+  if (typeof e?.download !== "number" || !downloadEventTypes.has(e.type))
+    return false;
+  // A download no window knows (ended or cancelled): never broadcast it.
+  if (!downloads.has(e.download)) return true;
+  const view = downloads.get(e.download);
+  if (e.type !== "file_download_chunk") downloads.delete(e.download);
+  if (view) send(view, { type: "event", event: value });
+  return true;
+}
+/** Acknowledgements and cancellations name a download of the window. */
+function downloadFrom(view: View, type: string, params: any) {
+  if (!ssh) return;
+  const owner = downloads.get(params?.download);
+  if (type === "file_download_ack") {
+    // A late acknowledgement of a download that ended is dropped.
+    if (owner === view && Number.isSafeInteger(params.offset))
+      ssh.request(type, { download: params.download, offset: params.offset });
+    return;
+  }
+  if (owner !== view) throw Error("Unknown download");
+  correlatedFrom(view, type, params);
+  cancelling.set(params.request, params.download);
+}
 const correlated = new Map<string, View | undefined>();
 /** Bound on replies awaited across windows (the server runs at most a few
  * file requests per connection; the rest wait in the windows). */
@@ -260,6 +311,16 @@ function correlatedEvent(value: any): boolean {
   if (typeof request !== "string" || !correlated.has(request)) return false;
   const view = correlated.get(request);
   correlated.delete(request);
+  if (cancelling.has(request)) {
+    downloads.delete(cancelling.get(request)!);
+    cancelling.delete(request);
+  }
+  const e = value.Stream;
+  if (e.type === "file_download_started" && typeof e.download === "number") {
+    downloads.set(e.download, view);
+    // The window that began it left before it started.
+    if (!view || !views.has(view)) cancelDownload(e.download);
+  }
   if (view) send(view, { type: "event", event: value });
   return true;
 }
@@ -289,6 +350,8 @@ function stop(message = "Signed out of all KelpMux windows.") {
   screens.clear();
   uploadRequests.clear();
   correlated.clear();
+  downloads.clear();
+  cancelling.clear();
   batches.clear();
   queuedChunks.length = 0;
   chunksInFlight = 0;
@@ -323,6 +386,9 @@ function leave(view: View) {
     if (entry.view === view) entry.view = undefined;
   for (const [request, owner] of correlated)
     if (owner === view) correlated.set(request, undefined);
+  // Its downloads would otherwise keep streaming to nobody.
+  for (const [download, owner] of downloads)
+    if (owner === view) cancelDownload(download);
   for (const [pane, owner] of owners)
     if (owner === view) {
       owners.delete(pane);
@@ -361,6 +427,7 @@ function event(value: any) {
     uploadEvent(value);
     return;
   }
+  if (downloadEvent(value)) return;
   if (correlatedEvent(value)) return;
   if (e.type === "welcome") {
     welcome = e;
@@ -624,6 +691,10 @@ async function message(view: View, data: any) {
       // An upload is deliberate, like typing: it keeps the session open.
       active();
       uploadFrom(view, type, params);
+      return;
+    }
+    if (type === "file_download_ack" || type === "file_download_cancel") {
+      downloadFrom(view, type, params);
       return;
     }
     if (correlatedTypes.has(type)) {

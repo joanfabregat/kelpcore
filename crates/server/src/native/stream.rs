@@ -33,7 +33,8 @@
 //! `recovery-signal`, `spawn-shell`, `unused-shell`, `stream-limits`,
 //! `notification-run` and `spawned-by` the same way, and decision 151a added
 //! `uploads` (see `super::uploads`), and ADR 0003 section 3 added `files`
-//! (see `super::files`). Device/MCP capabilities remain deferred.
+//! (see `super::files`), with `file-downloads` (see `super::downloads`).
+//! Device/MCP capabilities remain deferred.
 //!
 //! `binary-screens` (ADR 0003 section 2): after `binary_screens {enabled:
 //! true}`, each Update to that connection has `binary_screens: true`, empty
@@ -156,6 +157,7 @@ pub const CAPABILITIES: &[&str] = &[
     "binary-screens",
     "files",
     "bell-merge",
+    "file-downloads",
 ];
 /// Aggregate context budget of one multi-pane `search` reply.
 pub const MAX_SEARCH_CONTEXT: usize = 4 * 1024 * 1024;
@@ -392,6 +394,25 @@ pub enum Request {
         request: String,
         paths: Vec<String>,
     },
+    /// `file-downloads`: send one regular file's bytes, or files and folders
+    /// as one archive (`file_download_started`, then chunks).
+    FileDownloadBegin {
+        request: String,
+        paths: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        archive: Option<super::downloads::Archive>,
+    },
+    /// `file-downloads`: the client received the download's bytes up to
+    /// `offset` (the end of the oldest unacknowledged chunk).
+    FileDownloadAck {
+        download: u64,
+        offset: u64,
+    },
+    /// `file-downloads`: stop a download (`done` reply).
+    FileDownloadCancel {
+        request: String,
+        download: u64,
+    },
 }
 impl Request {
     /// The correlation identifier echoed by this request's reply and errors.
@@ -416,7 +437,9 @@ impl Request {
             | Self::FileMkdir { request, .. }
             | Self::FileRename { request, .. }
             | Self::FileTrash { request, .. }
-            | Self::FileDelete { request, .. } => Some(request),
+            | Self::FileDelete { request, .. }
+            | Self::FileDownloadBegin { request, .. }
+            | Self::FileDownloadCancel { request, .. } => Some(request),
             _ => None,
         }
     }
@@ -718,6 +741,46 @@ pub enum Event {
     FileError {
         request: String,
         error: super::files::Error,
+        /// `file-downloads`: the download that failed after it started.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        download: Option<u64>,
+    },
+    /// `file-downloads`: the download began. `size` is a single file's
+    /// size when it was opened; an archive has `archive`, and the entries
+    /// and input bytes the planning walk found.
+    FileDownloadStarted {
+        request: String,
+        download: u64,
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        size: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        archive: Option<super::downloads::Archive>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        entries: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        input_bytes: Option<u64>,
+    },
+    /// `file-downloads`: the next base64 bytes, at `offset`. Archives carry
+    /// the input bytes read so far (`input`), for progress.
+    FileDownloadChunk {
+        download: u64,
+        offset: u64,
+        data: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        input: Option<u64>,
+    },
+    /// `file-downloads`: every byte was sent: `size` bytes whose SHA-256 is
+    /// `hash`. `skipped` entries were left out of an archive (special
+    /// files, unreadable entries, mount points' contents); `changed` files
+    /// changed while they were read.
+    FileDownloadDone {
+        request: String,
+        download: u64,
+        size: u64,
+        hash: String,
+        skipped: u64,
+        changed: u64,
     },
 }
 
@@ -740,7 +803,9 @@ impl Event {
             | Self::FileContent { request, .. }
             | Self::FileWritten { request, .. }
             | Self::FileRemoved { request, .. }
-            | Self::FileError { request, .. } => Some(request),
+            | Self::FileError { request, .. }
+            | Self::FileDownloadStarted { request, .. }
+            | Self::FileDownloadDone { request, .. } => Some(request),
             Self::Error { request, .. } => request.as_deref(),
             _ => None,
         }

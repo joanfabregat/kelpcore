@@ -999,7 +999,7 @@ fn concurrent_operations_all_complete() {
                 assert!(pending.remove(&request));
                 contents += 1;
             }
-            Event::FileError { request, error } => {
+            Event::FileError { request, error, .. } => {
                 assert_eq!(error.code, Code::Busy);
                 assert!(pending.remove(&request));
             }
@@ -1074,7 +1074,7 @@ fn a_burst_of_refused_requests_keeps_the_connection() {
     while !pending.is_empty() {
         match peer.next() {
             Event::FileStat { request, .. } => assert!(pending.remove(&request)),
-            Event::FileError { request, error } => {
+            Event::FileError { request, error, .. } => {
                 assert_eq!(error.code, Code::Busy);
                 assert!(pending.remove(&request));
                 busy += 1;

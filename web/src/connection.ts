@@ -243,6 +243,8 @@ export class Session {
           "-o",
           "ServerAliveCountMax=3",
           "-o",
+          "IPQoS=none",
+          "-o",
           "ConnectionAttempts=1",
           "-o",
           "ConnectTimeout=15",

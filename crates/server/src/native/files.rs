@@ -98,6 +98,10 @@ pub struct Limits {
     pub max_in_flight: usize,
     pub max_path_bytes: usize,
     pub max_depth: usize,
+    /// `file-downloads`: download bounds and the flow-control window.
+    /// Absent from servers without downloads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub downloads: Option<super::downloads::Limits>,
 }
 pub const LIMITS: Limits = Limits {
     max_read_bytes: MAX_READ_BYTES,
@@ -107,6 +111,7 @@ pub const LIMITS: Limits = Limits {
     max_in_flight: MAX_IN_FLIGHT,
     max_path_bytes: MAX_PATH_BYTES,
     max_depth: MAX_DEPTH,
+    downloads: Some(super::downloads::LIMITS),
 };
 
 /// Server configuration of file operations.
@@ -210,14 +215,14 @@ impl Error {
             size: None,
         }
     }
-    fn at(mut self, path: &Path) -> Self {
+    pub(super) fn at(mut self, path: &Path) -> Self {
         self.path = Some(path.to_string_lossy().into_owned());
         self
     }
 }
-type Outcome<T> = std::result::Result<T, Error>;
+pub(super) type Outcome<T> = std::result::Result<T, Error>;
 /// A system error, classified.
-fn io_error(error: io::Error, path: &Path) -> Error {
+pub(super) fn io_error(error: io::Error, path: &Path) -> Error {
     let code = match error.raw_os_error() {
         Some(libc::ENOENT) => Code::NotFound,
         Some(libc::EACCES | libc::EPERM) => Code::PermissionDenied,
@@ -304,46 +309,51 @@ fn normalize_home(home: &Path) -> Outcome<PathBuf> {
     }
     Ok(result)
 }
-fn path_text(path: &Path) -> String {
+pub(super) fn path_text(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
-fn check(result: libc::c_int) -> io::Result<libc::c_int> {
+pub(super) fn check(result: libc::c_int) -> io::Result<libc::c_int> {
     if result < 0 {
         Err(io::Error::last_os_error())
     } else {
         Ok(result)
     }
 }
-fn cstring(bytes: &[u8]) -> io::Result<CString> {
+pub(super) fn cstring(bytes: &[u8]) -> io::Result<CString> {
     CString::new(bytes).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))
 }
-fn open_at(dir: RawFd, name: &CStr, flags: libc::c_int, mode: libc::c_uint) -> io::Result<OwnedFd> {
+pub(super) fn open_at(
+    dir: RawFd,
+    name: &CStr,
+    flags: libc::c_int,
+    mode: libc::c_uint,
+) -> io::Result<OwnedFd> {
     let fd = check(unsafe { libc::openat(dir, name.as_ptr(), flags | libc::O_CLOEXEC, mode) })?;
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
-const DIRECTORY: libc::c_int = libc::O_RDONLY | libc::O_DIRECTORY;
-fn stat_at(dir: RawFd, name: &CStr) -> io::Result<libc::stat> {
+pub(super) const DIRECTORY: libc::c_int = libc::O_RDONLY | libc::O_DIRECTORY;
+pub(super) fn stat_at(dir: RawFd, name: &CStr) -> io::Result<libc::stat> {
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
     check(unsafe { libc::fstatat(dir, name.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) })?;
     Ok(st)
 }
-fn stat_fd(fd: RawFd) -> io::Result<libc::stat> {
+pub(super) fn stat_fd(fd: RawFd) -> io::Result<libc::stat> {
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
     check(unsafe { libc::fstat(fd, &mut st) })?;
     Ok(st)
 }
-fn is_dir(st: &libc::stat) -> bool {
+pub(super) fn is_dir(st: &libc::stat) -> bool {
     st.st_mode & libc::S_IFMT == libc::S_IFDIR
 }
-fn is_regular(st: &libc::stat) -> bool {
+pub(super) fn is_regular(st: &libc::stat) -> bool {
     st.st_mode & libc::S_IFMT == libc::S_IFREG
 }
-fn is_symlink(st: &libc::stat) -> bool {
+pub(super) fn is_symlink(st: &libc::stat) -> bool {
     st.st_mode & libc::S_IFMT == libc::S_IFLNK
 }
 /// Refuse what is not a regular file, before it is opened.
-fn regular(st: &libc::stat, path: &Path, verb: &str) -> Outcome<()> {
+pub(super) fn regular(st: &libc::stat, path: &Path, verb: &str) -> Outcome<()> {
     if is_dir(st) {
         return Err(Error::new(Code::IsADirectory, format!("cannot {verb} a directory")).at(path));
     }
@@ -402,7 +412,7 @@ fn entry(name: String, st: &libc::stat, dir: RawFd, cname: &CStr) -> Entry {
 }
 /// A directory's entry names (without `.` and `..`), at most `limit` of
 /// them; `true` when the directory had more.
-fn names(dir: RawFd, limit: usize) -> io::Result<(Vec<CString>, bool)> {
+pub(super) fn names(dir: RawFd, limit: usize) -> io::Result<(Vec<CString>, bool)> {
     let copy = check(unsafe { libc::fcntl(dir, libc::F_DUPFD_CLOEXEC, 0) })?;
     let stream = unsafe { libc::fdopendir(copy) };
     if stream.is_null() {
@@ -507,11 +517,11 @@ fn random_hex() -> io::Result<String> {
 
 /// The parent directory of a normalised path, opened (following symlinks in
 /// the parent's own path, like a shell), and the final name.
-struct Location {
-    dir: OwnedFd,
-    name: CString,
+pub(super) struct Location {
+    pub(super) dir: OwnedFd,
+    pub(super) name: CString,
 }
-fn locate(path: &Path) -> Outcome<Location> {
+pub(super) fn locate(path: &Path) -> Outcome<Location> {
     let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
         return Err(Error::new(Code::InvalidPath, "the root directory has no name").at(path));
     };
@@ -1225,7 +1235,11 @@ fn trash_one(trash: &Trash, path: &Path, home: Option<&Path>) -> Outcome<PathBuf
 
 /// The `file_error` reply for a failed request.
 pub fn failure(request: String, error: Error) -> Event {
-    Event::FileError { request, error }
+    Event::FileError {
+        request,
+        error,
+        download: None,
+    }
 }
 fn removal(
     request: String,

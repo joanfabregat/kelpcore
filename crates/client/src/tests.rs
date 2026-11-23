@@ -176,6 +176,35 @@ fn file_replies_reach_the_page_when_well_formed() {
     }
 }
 
+#[test]
+fn download_events_are_checked() {
+    let hash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+    let mut client = Client::default();
+    for event in [
+        json!({"Stream":{"type":"file_download_started","request":"file-1","download":1,"name":"a.txt","size":3}}),
+        json!({"Stream":{"type":"file_download_started","request":"file-2","download":2,"name":"src.tar.gz","archive":"tar.gz","entries":4,"input_bytes":900}}),
+        json!({"Stream":{"type":"file_download_chunk","download":1,"offset":0,"data":"YWJj"}}),
+        json!({"Stream":{"type":"file_download_chunk","download":2,"offset":0,"data":"H4sI","input":512}}),
+        json!({"Stream":{"type":"file_download_done","request":"file-1","download":1,"size":3,"hash":hash,"skipped":0,"changed":0}}),
+        json!({"Stream":{"type":"file_error","request":"file-2","download":2,"error":{"code":"io","message":"read failed"}}}),
+    ] {
+        assert!(client.accept(&event).is_ok(), "{event}");
+    }
+    for event in [
+        json!({"Stream":{"type":"file_download_started","request":"file-1","download":1,"name":""}}),
+        json!({"Stream":{"type":"file_download_started","request":"file-1","name":"a"}}),
+        json!({"Stream":{"type":"file_download_started","request":"file-1","download":1,"name":"a","archive":"zip"}}),
+        json!({"Stream":{"type":"file_download_chunk","download":1,"offset":0,"data":""}}),
+        json!({"Stream":{"type":"file_download_chunk","download":1,"data":"YWJj"}}),
+        json!({"Stream":{"type":"file_download_chunk","download":1,"offset":0,"data":"A".repeat(4 * 1024 * 1024 + 1)}}),
+        json!({"Stream":{"type":"file_download_done","request":"file-1","download":1,"size":3,"hash":"zz","skipped":0,"changed":0}}),
+        json!({"Stream":{"type":"file_download_done","request":"file-1","download":1,"size":3,"hash":hash}}),
+        json!({"Stream":{"type":"file_error","request":"file-2","download":"x","error":{"code":"io","message":"x"}}}),
+    ] {
+        assert!(client.accept(&event).is_err(), "{event}");
+    }
+}
+
 // Binary screens (`binary-screens`): the same stream sent as JSON screens to
 // one client and as binary records to another leaves both with the same
 // screens, and the binary client's events carry the screens as JSON.

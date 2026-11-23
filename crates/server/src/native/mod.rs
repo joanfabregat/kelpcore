@@ -7,6 +7,7 @@ pub mod bridge;
 pub mod cli;
 pub mod connection;
 pub mod diagnostics;
+pub mod downloads;
 pub mod engine;
 pub mod files;
 pub mod history;
