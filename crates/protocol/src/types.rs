@@ -2,7 +2,7 @@ use crate::model::Status;
 use serde::{Deserialize, Serialize};
 pub type PaneId = u64;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub enum Color {
     #[default]
     Default,
@@ -139,4 +139,23 @@ pub struct ShellCommand {
     /// command (full-screen programs such as editors, pagers and monitors).
     #[serde(default)]
     pub alternate_screen: bool,
+}
+
+/// A full pane screen. A snapshot starts a revision chain at revision 1.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaneSnapshot {
+    pub pane: PaneId,
+    pub revision: u64,
+    pub screen: Screen,
+}
+/// The cells that changed since the exact `base` revision, as
+/// `(row * cols + column, cell)`; `revision` is `base + 1`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PanePatch {
+    pub pane: PaneId,
+    pub base: u64,
+    pub revision: u64,
+    pub cursor: Option<Cursor>,
+    pub modes: InputModes,
+    pub changes: Vec<(usize, Cell)>,
 }

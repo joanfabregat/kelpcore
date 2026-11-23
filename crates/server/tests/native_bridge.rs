@@ -637,3 +637,64 @@ fn bridge_relays_session_api_requests_and_opt_in_events() {
     assert_eq!(created, spawned);
     assert!(bridge.finish().success());
 }
+
+#[test]
+fn bridge_relays_binary_screen_records_unchanged() {
+    let server = Server::start();
+    let mut child = ChildGuard(
+        server
+            .command("bridge")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let mut input = child.stdin.take().unwrap();
+    let mut output = child.stdout.take().unwrap();
+    for request in [
+        Request::Hello {
+            version: stream::VERSION,
+        },
+        Request::BinaryScreens { enabled: true },
+        Request::Subscribe { panes: vec![1] },
+    ] {
+        write_message(&mut input, &ClientMessage::Stream(request)).unwrap();
+    }
+    let (sender, records) = mpsc::channel();
+    thread::spawn(move || {
+        while let Ok(Some(record)) = read_server_record(&mut output) {
+            if sender.send(record).is_err() {
+                break;
+            }
+        }
+    });
+    let mut announced = false;
+    loop {
+        match records
+            .recv_timeout(Duration::from_secs(5))
+            .expect("bridge closed or timed out before a binary record")
+        {
+            ServerRecord::Message(ServerMessage::Stream(Event::Update(update))) => {
+                announced = update.binary_screens;
+            }
+            ServerRecord::Screens(bytes) => {
+                assert!(announced);
+                let messages = kelpclient_protocol::screens::decode(
+                    &bytes,
+                    kelpclient_protocol::screens::DEFAULT_MAX_CELLS,
+                )
+                .unwrap();
+                if let Some(kelpclient_protocol::screens::ScreenMessage::Snapshot(snapshot)) =
+                    messages.into_iter().find(|m| m.pane() == 1)
+                {
+                    stream::validate(&snapshot).unwrap();
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    drop(input);
+    assert!(wait(&mut child).success());
+}

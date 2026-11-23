@@ -4,7 +4,10 @@
 //! `ClientMessage::Stream` requests; the server answers with
 //! `ServerMessage::Stream` events, or `ServerMessage::Error` for a record it
 //! cannot accept (such as a message of the composed protocol 58 that 0.3
-//! removed), after which it closes the connection.
+//! removed), after which it closes the connection. A connection that enabled
+//! `binary-screens` also receives binary screen records, whose payload starts
+//! with `kelpclient_protocol::screens::RECORD_MARKER` (never a JSON byte); read
+//! them with `read_server_record`.
 use crate::{Result, model::Status};
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
@@ -91,6 +94,13 @@ pub fn write_message<T: Serialize>(writer: &mut impl Write, value: &T) -> Result
     Ok(())
 }
 pub fn read_message<T: serde::de::DeserializeOwned>(reader: &mut impl Read) -> Result<Option<T>> {
+    match read_frame(reader)? {
+        Some(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
+        None => Ok(None),
+    }
+}
+/// One framed payload, unparsed; `None` at end of stream.
+pub fn read_frame(reader: &mut impl Read) -> Result<Option<Vec<u8>>> {
     let mut header = [0u8; 4];
     let count = loop {
         match reader.read(&mut header[..1]) {
@@ -108,5 +118,22 @@ pub fn read_message<T: serde::de::DeserializeOwned>(reader: &mut impl Read) -> R
     }
     let mut bytes = vec![0; length];
     reader.read_exact(&mut bytes)?;
-    Ok(Some(serde_json::from_slice(&bytes)?))
+    Ok(Some(bytes))
+}
+/// A server record on a connection that may have enabled `binary-screens`.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Clone)]
+pub enum ServerRecord {
+    Message(ServerMessage),
+    /// A binary screen record; decode it with `kelpclient_protocol::screens::decode`.
+    Screens(Vec<u8>),
+}
+pub fn read_server_record(reader: &mut impl Read) -> Result<Option<ServerRecord>> {
+    let Some(bytes) = read_frame(reader)? else {
+        return Ok(None);
+    };
+    if kelpclient_protocol::screens::is_binary_record(&bytes) {
+        return Ok(Some(ServerRecord::Screens(bytes)));
+    }
+    Ok(Some(ServerRecord::Message(serde_json::from_slice(&bytes)?)))
 }

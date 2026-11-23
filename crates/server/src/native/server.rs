@@ -444,6 +444,8 @@ struct StreamClient {
     clipboard: bool,
     session_events: bool,
     host: bool,
+    /// `binary-screens`: screens go in a binary record after each update.
+    binary: bool,
     panes: Vec<PaneId>,
     previous: BTreeMap<PaneId, super::stream::PaneSnapshot>,
     metadata: Option<super::stream::Update>,
@@ -454,7 +456,10 @@ struct PaneLease {
     theme: Option<[[u8; 3]; 2]>,
 }
 fn wire(message: &ServerMessage) -> Result<Vec<u8>> {
-    let bytes = serde_json::to_vec(message)?;
+    wire_bytes(serde_json::to_vec(message)?)
+}
+/// Frame one payload: a JSON message or a binary screen record.
+fn wire_bytes(bytes: Vec<u8>) -> Result<Vec<u8>> {
     if bytes.len() > MAX_MESSAGE {
         return Err("native response is too large".into());
     }
@@ -856,6 +861,7 @@ impl Server {
                 clipboard: false,
                 session_events: false,
                 host: false,
+                binary: false,
                 panes: Vec::new(),
                 previous: BTreeMap::new(),
                 metadata: None,
@@ -1060,6 +1066,13 @@ impl Server {
                 let stream = self.clients.get_mut(&id).unwrap().stream.as_mut().unwrap();
                 stream.session_events = enabled;
                 // The next update carries the per-pane session data.
+                stream.metadata = None;
+            }
+            Request::BinaryScreens { enabled } => {
+                // Baselines stay valid: a client applies the next binary patch
+                // to the screen it holds, whichever format delivered it.
+                let stream = self.clients.get_mut(&id).unwrap().stream.as_mut().unwrap();
+                stream.binary = enabled;
                 stream.metadata = None;
             }
             Request::HostStatus { enabled } => {
@@ -1366,7 +1379,11 @@ impl Server {
                     Vec::new()
                 },
                 host: if stream.host { host.clone() } else { None },
+                binary_screens: stream.binary,
             };
+            let mut screens = stream
+                .binary
+                .then(kelpclient_protocol::screens::RecordBuilder::new);
             stream.panes.retain(|pane| self.panes.contains_key(pane));
             stream
                 .previous
@@ -1391,14 +1408,20 @@ impl Server {
                 };
                 let revision = if let Some(patch) = patch {
                     let revision = patch.revision;
-                    update.patches.push(patch);
+                    match screens.as_mut() {
+                        Some(screens) => screens.patch(&patch, &screen),
+                        None => update.patches.push(patch),
+                    }
                     revision
                 } else {
-                    update.snapshots.push(PaneSnapshot {
-                        pane: *pane,
-                        revision: 1,
-                        screen: screen.clone(),
-                    });
+                    match screens.as_mut() {
+                        Some(screens) => screens.snapshot(*pane, 1, &screen),
+                        None => update.snapshots.push(PaneSnapshot {
+                            pane: *pane,
+                            revision: 1,
+                            screen: screen.clone(),
+                        }),
+                    }
                     1
                 };
                 stream.previous.insert(
@@ -1421,15 +1444,25 @@ impl Server {
                 vitals: update.vitals.clone(),
                 sessions: update.sessions.clone(),
                 host: update.host.clone(),
+                binary_screens: update.binary_screens,
             };
             if update.snapshots.is_empty()
                 && update.patches.is_empty()
+                && screens.as_ref().is_none_or(|screens| screens.is_empty())
                 && stream.metadata.as_ref() == Some(&metadata)
             {
                 continue;
             }
             stream.metadata = Some(metadata);
-            let packet = match wire(&ServerMessage::Stream(Event::Update(update))) {
+            let packet =
+                wire(&ServerMessage::Stream(Event::Update(update))).and_then(|mut packet| {
+                    // The update and its screens are one replaceable packet.
+                    if let Some(screens) = screens {
+                        packet.extend(wire_bytes(screens.finish())?);
+                    }
+                    Ok(packet)
+                });
+            let packet = match packet {
                 Ok(packet) => packet,
                 Err(_) => {
                     removed.push(*id);

@@ -31,9 +31,15 @@
 //! `notification-run` and `spawned-by` the same way, and decision 151a added
 //! `uploads` (see `super::uploads`). Device/MCP capabilities
 //! remain deferred.
-use super::protocol::{
-    Cell, Cursor, InputModes, MouseEvent, Notification, PaneId, PaneInfo, PaneSearchMatch, Screen,
-};
+//!
+//! `binary-screens` (ADR 0003 section 2): after `binary_screens {enabled:
+//! true}`, each Update to that connection has `binary_screens: true`, empty
+//! `snapshots`/`patches`, and is immediately followed by exactly one binary
+//! record (`kelpclient_protocol::screens`) carrying its screens with the same
+//! revision rules. Both records form one replaceable packet, so the
+//! backpressure replacement above never separates them. Other connections
+//! never receive a binary record.
+use super::protocol::{MouseEvent, Notification, PaneId, PaneInfo, PaneSearchMatch, Screen};
 use crate::Result;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -144,6 +150,7 @@ pub const CAPABILITIES: &[&str] = &[
     "spawned-by",
     "diagnostics",
     "uploads",
+    "binary-screens",
 ];
 /// Aggregate context budget of one multi-pane `search` reply.
 pub const MAX_SEARCH_CONTEXT: usize = 4 * 1024 * 1024;
@@ -277,6 +284,12 @@ pub enum Request {
         pane: PaneId,
         line: i32,
     },
+    /// `binary-screens`: receive this connection's pane screens as binary
+    /// records (`kelpclient_protocol::screens`) after each `update` instead
+    /// of `Update.snapshots` and `Update.patches`.
+    BinaryScreens {
+        enabled: bool,
+    },
     /// `host-status`: include the host process/disk snapshot in updates.
     HostStatus {
         enabled: bool,
@@ -409,12 +422,8 @@ pub struct PaneSearchResult {
     pub truncated: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PaneSnapshot {
-    pub pane: PaneId,
-    pub revision: u64,
-    pub screen: Screen,
-}
+/// Pane screens and patches are protocol types, re-exported here.
+pub use super::protocol::{PanePatch, PaneSnapshot};
 
 /// Check a full pane screen before allocating a renderer's backing surface.
 pub fn validate(snapshot: &PaneSnapshot) -> Result<()> {
@@ -438,15 +447,6 @@ pub fn validate(snapshot: &PaneSnapshot) -> Result<()> {
     Ok(())
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PanePatch {
-    pub pane: PaneId,
-    pub base: u64,
-    pub revision: u64,
-    pub cursor: Option<Cursor>,
-    pub modes: InputModes,
-    pub changes: Vec<(usize, Cell)>,
-}
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Lease {
     pub pane: PaneId,
     pub owner: u64,
@@ -467,6 +467,10 @@ pub struct Update {
     /// Only for connections that enabled `host_status`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host: Option<Box<super::status::Snapshot>>,
+    /// `binary-screens`: this update's screens follow it as exactly one binary
+    /// record, and `snapshots` and `patches` are empty. Omitted when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub binary_screens: bool,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
