@@ -532,8 +532,9 @@ async function message(view: View, data: any) {
     const type = data.request,
       params = data.params || {};
     if (type === "hello") return;
-    // The hosting Session opts in once; views cannot toggle the shared setting.
-    if (type === "clipboard") return;
+    // The hosting Session opts in once; views cannot toggle the shared
+    // settings. Screens reach views as JSON whatever the connection uses.
+    if (type === "clipboard" || type === "binary_screens") return;
     if (type === "subscribe") {
       const panes = params.panes;
       if (

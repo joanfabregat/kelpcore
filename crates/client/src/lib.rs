@@ -1,12 +1,14 @@
 //! Portable terminal types and transactional browser/native client state.
 pub mod model;
 pub mod types;
-use serde::{Deserialize, Serialize};
+use kelpclient_protocol::screens::{self, ScreenMessage};
+use serde::Deserialize;
 use serde_json::Value;
 #[cfg(target_arch = "wasm32")]
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
 use types::*;
+pub use types::{PanePatch, PaneSnapshot};
 
 pub type Result<T> = std::result::Result<T, String>;
 pub const MAX_MESSAGE: usize = 16 * 1024 * 1024;
@@ -80,21 +82,6 @@ pub fn history_screen(lines: &[String], cols: u16, rows: u16) -> Result<Screen> 
         modes: InputModes::default(),
     })
 }
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PaneSnapshot {
-    pub pane: PaneId,
-    pub revision: u64,
-    pub screen: Screen,
-}
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PanePatch {
-    pub pane: PaneId,
-    pub base: u64,
-    pub revision: u64,
-    pub cursor: Option<Cursor>,
-    pub modes: InputModes,
-    pub changes: Vec<(usize, Cell)>,
-}
 pub use kelpclient_protocol::cell_valid;
 /// A client-chosen correlation identifier, as the server accepts them:
 /// 1–128 ASCII letters, digits, `-` or `_`.
@@ -163,9 +150,25 @@ pub struct Client {
     pub client: u64,
     pub screens: BTreeMap<PaneId, PaneSnapshot>,
     incoming: Vec<u8>,
+    /// An update with `binary_screens`, waiting for the binary record that
+    /// must follow it (KelpServer `binary-screens`).
+    pending: Option<Value>,
+    /// Welcome `limits.subscribed_cells`, bounding a binary record's cells.
+    subscribed_cells: Option<usize>,
+}
+/// Whether `value` is an update whose screens follow as a binary record.
+fn binary_update(value: &Value) -> bool {
+    value["Stream"]["type"] == "update" && value["Stream"]["binary_screens"] == true
 }
 impl Client {
     /// Bytes are framed exactly as they are on the existing SSH stdio bridge.
+    ///
+    /// On a connection that enabled `binary-screens`, an update carrying
+    /// `binary_screens: true` is held until the binary record after it, whose
+    /// screens are then applied exactly as a JSON update's. The update is
+    /// returned with those screens as JSON `snapshots` and `patches` (every
+    /// cell of each changed row) and without `binary_screens`, so consumers
+    /// of the returned events see one format.
     pub fn receive(&mut self, bytes: &[u8]) -> Result<Vec<Value>> {
         if self.incoming.len() + bytes.len() > 2 * MAX_MESSAGE {
             return Err("receive buffer limit".into());
@@ -182,10 +185,31 @@ impl Client {
             if self.incoming.len() - used < length + 4 {
                 break;
             }
-            let value: Value = serde_json::from_slice(&self.incoming[used + 4..used + 4 + length])
-                .map_err(|e| e.to_string())?;
-            self.accept(&value)?;
-            events.push(value);
+            let payload = &self.incoming[used + 4..used + 4 + length];
+            if screens::is_binary_record(payload) {
+                if self.pending.is_none() {
+                    return Err("binary screen record without its update".into());
+                }
+                let messages =
+                    screens::decode(payload, self.max_cells()).map_err(|e| e.to_string())?;
+                let update = self.pending.take().expect("checked above");
+                events.push(self.accept_screens(update, messages)?);
+            } else {
+                if self.pending.is_some() {
+                    return Err("expected a binary screen record after the update".into());
+                }
+                let value: Value = serde_json::from_slice(payload).map_err(|e| e.to_string())?;
+                if binary_update(&value) {
+                    let empty = |key| value["Stream"][key].as_array().is_some_and(Vec::is_empty);
+                    if !empty("snapshots") || !empty("patches") {
+                        return Err("binary screen update carries JSON screens".into());
+                    }
+                    self.pending = Some(value);
+                } else {
+                    self.accept(&value)?;
+                    events.push(value);
+                }
+            }
             used += length + 4;
             if events.len() > 256 {
                 return Err("event batch limit".into());
@@ -193,6 +217,33 @@ impl Client {
         }
         self.incoming.drain(..used);
         Ok(events)
+    }
+    /// The cell budget of one binary record: the Welcome's advertised
+    /// `subscribed_cells`, never above what this client keeps.
+    fn max_cells(&self) -> usize {
+        self.subscribed_cells
+            .unwrap_or(screens::DEFAULT_MAX_CELLS)
+            .min(MAX_CELLS)
+    }
+    /// Applies a held `binary_screens` update with its decoded record and
+    /// returns the update as JSON screens would have carried it.
+    fn accept_screens(&mut self, mut update: Value, messages: Vec<ScreenMessage>) -> Result<Value> {
+        let mut snapshots = Vec::new();
+        let mut patches = Vec::new();
+        for message in messages {
+            match message {
+                ScreenMessage::Snapshot(snapshot) => snapshots.push(snapshot),
+                ScreenMessage::Patch(patch) => patches.push(patch.into_pane_patch()),
+            }
+        }
+        let event = &mut update["Stream"];
+        event["snapshots"] = serde_json::to_value(&snapshots).map_err(|e| e.to_string())?;
+        event["patches"] = serde_json::to_value(&patches).map_err(|e| e.to_string())?;
+        if let Some(event) = event.as_object_mut() {
+            event.remove("binary_screens");
+        }
+        self.accept_update(&update["Stream"], snapshots, patches)?;
+        Ok(update)
     }
     pub fn accept(&mut self, value: &Value) -> Result<()> {
         let Some(event) = value.get("Stream") else {
@@ -212,78 +263,20 @@ impl Client {
                 }
                 self.epoch = epoch.into();
                 self.client = event["client"].as_u64().unwrap();
+                self.subscribed_cells = event["limits"]["subscribed_cells"]
+                    .as_u64()
+                    .filter(|cells| *cells > 0)
+                    .map(|cells| usize::try_from(cells).unwrap_or(usize::MAX));
             }
             Some("update") => {
-                if self.epoch.is_empty() || event["epoch"] != self.epoch {
-                    return Err("stream epoch changed".into());
+                if event["binary_screens"] == true {
+                    return Err("binary screen update without its record".into());
                 }
-                let wanted: Vec<u64> = serde_json::from_value(event["subscribed"].clone())
+                let snapshots = Vec::<PaneSnapshot>::deserialize(&event["snapshots"])
                     .map_err(|e| e.to_string())?;
-                let wanted_set: BTreeSet<_> = wanted.iter().copied().collect();
-                let panes: Vec<PaneInfo> =
-                    serde_json::from_value(event["panes"].clone()).map_err(|e| e.to_string())?;
-                let pane_ids: BTreeSet<_> = panes.iter().map(|p| p.id).collect();
-                if panes.len() > 4096
-                    || pane_ids.len() != panes.len()
-                    || pane_ids.contains(&0)
-                    || !wanted_set.is_subset(&pane_ids)
-                    || wanted.len() > 10
-                    || wanted_set.len() != wanted.len()
-                {
-                    return Err("invalid subscriptions".into());
-                }
-                let leases = event["leases"].as_array().ok_or("missing leases")?;
-                let mut leased = BTreeSet::new();
-                if leases.len() > 4096
-                    || leases.iter().any(|lease| {
-                        let id = lease["pane"].as_u64().unwrap_or(0);
-                        !pane_ids.contains(&id)
-                            || !leased.insert(id)
-                            || lease["owner"].as_u64().unwrap_or(0) == 0
-                    })
-                {
-                    return Err("invalid lease metadata".into());
-                }
-                let notifications = event["notifications"]
-                    .as_array()
-                    .ok_or("missing notifications")?;
-                if notifications.len() > 256
-                    || notifications.iter().any(|event| {
-                        event["title"]
-                            .as_str()
-                            .is_none_or(|title| title.len() > 4096)
-                    })
-                {
-                    return Err("invalid notifications".into());
-                }
-                let mut next = self.screens.clone();
-                next.retain(|id, _| wanted_set.contains(id));
-                let mut changed = BTreeSet::new();
-                let snapshots: Vec<PaneSnapshot> =
-                    serde_json::from_value(event["snapshots"].clone())
-                        .map_err(|e| e.to_string())?;
-                let patches: Vec<PanePatch> =
-                    serde_json::from_value(event["patches"].clone()).map_err(|e| e.to_string())?;
-                for s in snapshots {
-                    validate(&s)?;
-                    if !wanted_set.contains(&s.pane) || !changed.insert(s.pane) {
-                        return Err("invalid snapshot subscription".into());
-                    }
-                    next.insert(s.pane, s);
-                }
-                for p in patches {
-                    if !wanted_set.contains(&p.pane) || !changed.insert(p.pane) {
-                        return Err("invalid patch subscription".into());
-                    }
-                    let old = next.get(&p.pane).ok_or("patch without snapshot")?;
-                    next.insert(p.pane, apply(old, &p)?);
-                }
-                if next.values().map(|s| s.screen.cells.len()).sum::<usize>() > MAX_CELLS
-                    || wanted.iter().any(|p| !next.contains_key(p))
-                {
-                    return Err("missing baseline or cell budget".into());
-                }
-                self.screens = next;
+                let patches =
+                    Vec::<PanePatch>::deserialize(&event["patches"]).map_err(|e| e.to_string())?;
+                self.accept_update(event, snapshots, patches)?;
             }
             Some("clipboard") => {
                 if event["pane"].as_u64().is_none_or(|pane| pane == 0)
@@ -339,6 +332,79 @@ impl Client {
             Some("lease") | Some("error") => {}
             _ => return Err("unsupported stream event".into()),
         }
+        Ok(())
+    }
+    /// Checks an update's metadata and applies its screens transactionally,
+    /// whichever format carried them.
+    fn accept_update(
+        &mut self,
+        event: &Value,
+        snapshots: Vec<PaneSnapshot>,
+        patches: Vec<PanePatch>,
+    ) -> Result<()> {
+        if self.epoch.is_empty() || event["epoch"] != self.epoch {
+            return Err("stream epoch changed".into());
+        }
+        let wanted = Vec::<u64>::deserialize(&event["subscribed"]).map_err(|e| e.to_string())?;
+        let wanted_set: BTreeSet<_> = wanted.iter().copied().collect();
+        let panes = Vec::<PaneInfo>::deserialize(&event["panes"]).map_err(|e| e.to_string())?;
+        let pane_ids: BTreeSet<_> = panes.iter().map(|p| p.id).collect();
+        if panes.len() > 4096
+            || pane_ids.len() != panes.len()
+            || pane_ids.contains(&0)
+            || !wanted_set.is_subset(&pane_ids)
+            || wanted.len() > 10
+            || wanted_set.len() != wanted.len()
+        {
+            return Err("invalid subscriptions".into());
+        }
+        let leases = event["leases"].as_array().ok_or("missing leases")?;
+        let mut leased = BTreeSet::new();
+        if leases.len() > 4096
+            || leases.iter().any(|lease| {
+                let id = lease["pane"].as_u64().unwrap_or(0);
+                !pane_ids.contains(&id)
+                    || !leased.insert(id)
+                    || lease["owner"].as_u64().unwrap_or(0) == 0
+            })
+        {
+            return Err("invalid lease metadata".into());
+        }
+        let notifications = event["notifications"]
+            .as_array()
+            .ok_or("missing notifications")?;
+        if notifications.len() > 256
+            || notifications.iter().any(|event| {
+                event["title"]
+                    .as_str()
+                    .is_none_or(|title| title.len() > 4096)
+            })
+        {
+            return Err("invalid notifications".into());
+        }
+        let mut next = self.screens.clone();
+        next.retain(|id, _| wanted_set.contains(id));
+        let mut changed = BTreeSet::new();
+        for s in snapshots {
+            validate(&s)?;
+            if !wanted_set.contains(&s.pane) || !changed.insert(s.pane) {
+                return Err("invalid snapshot subscription".into());
+            }
+            next.insert(s.pane, s);
+        }
+        for p in patches {
+            if !wanted_set.contains(&p.pane) || !changed.insert(p.pane) {
+                return Err("invalid patch subscription".into());
+            }
+            let old = next.get(&p.pane).ok_or("patch without snapshot")?;
+            next.insert(p.pane, apply(old, &p)?);
+        }
+        if next.values().map(|s| s.screen.cells.len()).sum::<usize>() > MAX_CELLS
+            || wanted.iter().any(|p| !next.contains_key(p))
+        {
+            return Err("missing baseline or cell budget".into());
+        }
+        self.screens = next;
         Ok(())
     }
     pub fn selection(&self, pane: u64, start: Point, end: Point) -> Result<String> {

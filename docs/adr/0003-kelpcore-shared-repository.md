@@ -1,6 +1,6 @@
 # ADR 0003: KelpCore holds the server and every client-shared component
 
-- Status: Accepted by Joan 2026-11-22 (America/Los_Angeles); phase A (client core and browser layer moved) implemented 2026-11-22.
+- Status: Accepted by Joan 2026-11-22 (America/Los_Angeles); phase A (client core and browser layer moved) implemented 2026-11-22; binary screens (section 2): client adoption (client core decoding, browser opt-in) implemented 2026-11-22.
 - Numbering continues KelpServer's ADRs ([0001](../../crates/server/docs/adr/0001-native-client-protocol-and-device-capabilities.md), [0002](../../crates/server/docs/adr/0002-generic-session-server.md)), which stay where they are.
 - Related: KelpMux [ADR 0003 (web client)](https://github.com/joanfabregat/kelpmux/blob/main/docs/adr/0003-web-client-in-kelpmux.md), KelpHub ADR 0007 (multi-tenant, Kubernetes-only; private repository).
 

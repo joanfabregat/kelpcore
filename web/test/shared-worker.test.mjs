@@ -652,3 +652,24 @@ test("uploads go to the window that began them, within one connection-wide windo
   await host({ type: "done", request: cancel.params.request });
   assert.equal(events(a, "done").length, 0);
 });
+
+test("a window's binary-screens opt-in stays with the hosting connection", async () => {
+  const h = harness({ extra: { capabilities: ["binary-screens"] } }),
+    a = h.attach(),
+    b = h.attach();
+  await h.join(a);
+  await h.join(b, { resumeOnly: true });
+  const count = h.calls.length;
+  // Each window's Session sees the replayed Welcome and asks to opt in; the
+  // host page's own Session already did on the shared connection.
+  await h.send(b, {
+    type: "request",
+    request: "binary_screens",
+    params: { enabled: false },
+  });
+  assert.equal(h.calls.length, count);
+  assert.equal(
+    b.messages.filter((m) => m.event?.Stream?.type === "error").length,
+    0,
+  );
+});
