@@ -539,7 +539,7 @@ fn realistic(cols: u16, rows: u16, blank_after: usize) -> Screen {
                 let target = rng.below(u64::from(cols) * 9 / 10) as usize + 10;
                 while row.len() < target {
                     let fg = *rng.pick(&colors);
-                    line(&mut row, rng.pick(&words), fg, fg == Color::Indexed(1));
+                    line(&mut row, *rng.pick(&words[..]), fg, fg == Color::Indexed(1));
                     line(&mut row, " ", Color::Default, false);
                 }
             }
