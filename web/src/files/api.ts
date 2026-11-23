@@ -7,6 +7,10 @@
 // At most the server's `max_in_flight` requests run at once: further calls
 // wait in a queue, and a `busy` refusal (other windows sharing the
 // connection, or the server's own bound) is retried a few times.
+// Downloads (`file-downloads`) start with a correlated request, then stream
+// chunks named by the server's download identifier, each acknowledged once
+// the caller's sink has written it (see `download`; `save.ts` saves to the
+// user's computer).
 // The application supplies the transport, as for uploads; this module
 // imports nothing from it, nor from React or the DOM.
 
@@ -19,6 +23,68 @@ export type FileLimits = {
   max_in_flight: number;
   max_path_bytes: number;
   max_depth: number;
+  /** Downloads (`file-downloads`), absent from servers without them. */
+  downloads?: DownloadLimits;
+};
+/** Welcome `file_limits.downloads`. */
+export type DownloadLimits = {
+  /** Bytes per chunk. */
+  chunk_bytes: number;
+  /** Chunks the server sends before the oldest is acknowledged. */
+  max_chunks_in_flight: number;
+  /** Unfinished downloads per connection. */
+  max_downloads: number;
+  max_archive_entries: number;
+  max_archive_bytes: number;
+};
+/** Archive formats a download can use. */
+export type DownloadArchive = "tar.gz";
+/** What `file_download_started` announced. */
+export type DownloadStart = {
+  /** The suggested file name: the file's, or `<folder>.tar.gz`. */
+  name: string;
+  /** A single file's size when the server opened it. */
+  size?: number;
+  archive?: DownloadArchive;
+  /** Archives: entries and input bytes the server's planning walk found. */
+  entries?: number;
+  inputBytes?: number;
+};
+export type DownloadProgress = {
+  /** Bytes received and written so far. */
+  received: number;
+  /** A single file's size, when known. */
+  size?: number;
+  /** Archives: input bytes the server has read, of `inputBytes`. */
+  input?: number;
+  inputBytes?: number;
+};
+export type DownloadResult = {
+  name: string;
+  archive?: DownloadArchive;
+  /** Bytes received. */
+  size: number;
+  /** SHA-256 of the bytes, as the server computed it. */
+  hash: string;
+  /** Archive entries left out (special files, unreadable entries). */
+  skipped: number;
+  /** Files that changed while the server read them. */
+  changed: number;
+};
+/** Where a download's bytes go. `write` may return a promise: the next
+ * chunk is acknowledged only once it settles, so a slow disk slows the
+ * server rather than filling memory. */
+export type DownloadSink = {
+  start?(start: DownloadStart): void | Promise<void>;
+  write(bytes: Uint8Array): void | Promise<void>;
+};
+export type DownloadOptions = {
+  archive?: DownloadArchive;
+  sink: DownloadSink;
+  onProgress?: (progress: DownloadProgress) => void;
+  /** Aborting cancels the download on the server; the call rejects with
+   * code `cancelled`. */
+  signal?: AbortSignal;
 };
 export type FileKind = "file" | "dir" | "symlink" | "other";
 /** One entry as `lstat` sees it: a symlink is described, not followed. */
@@ -86,7 +152,9 @@ export type FileErrorCode =
   | "io"
   /** Client side: the connection closed or the reply never came. */
   | "closed"
-  | "timeout";
+  | "timeout"
+  /** Client side: the download was cancelled. */
+  | "cancelled";
 /** The server's error body (`file_error.error`). */
 export type FileErrorBody = {
   code: string;
@@ -144,6 +212,7 @@ const descriptions: Record<string, string> = {
   io: "Input/output error",
   closed: "The connection is closed",
   timeout: "No reply from the server; the outcome is unknown",
+  cancelled: "The download was cancelled",
 };
 /** A short description of an error code, for a message without one. */
 export function describeCode(code: string): string {
@@ -169,7 +238,26 @@ export function readFileLimits(value: any): FileLimits | null {
     if (!Number.isSafeInteger(n) || n < 1) return null;
     limits[key] = n;
   }
+  const downloads = readDownloadLimits(value.downloads);
+  if (downloads) limits.downloads = downloads;
   return limits as FileLimits;
+}
+const downloadKeys = [
+  "chunk_bytes",
+  "max_chunks_in_flight",
+  "max_downloads",
+  "max_archive_entries",
+  "max_archive_bytes",
+] as const;
+function readDownloadLimits(value: any): DownloadLimits | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const limits: any = {};
+  for (const key of downloadKeys) {
+    const n = value[key];
+    if (!Number.isSafeInteger(n) || n < 1) return undefined;
+    limits[key] = n;
+  }
+  return limits as DownloadLimits;
 }
 
 /** Request identifiers of this module start with this prefix. */
@@ -210,6 +298,7 @@ const replies: Record<string, string> = {
   file_rename: "done",
   file_trash: "file_removed",
   file_delete: "file_removed",
+  file_download_begin: "file_download_started",
 };
 
 type Pending = {
@@ -219,6 +308,18 @@ type Pending = {
   reject: (error: FileError) => void;
   attempts: number;
   timer?: ReturnType<typeof setTimeout>;
+  /** Called with the reply before the promise settles, in the same event
+   * (a download registers itself before its first chunk is handled). */
+  onReply?: (event: any) => void;
+};
+/** A started download: its chunks are written in order, each acknowledged
+ * once written. */
+type Download = {
+  /** Writes chain here, so chunks reach the sink in order. */
+  writing: Promise<void>;
+  /** A chunk, the end or an error arrived; restarts the stall timer. */
+  event(e: any): void;
+  fail(error: FileError): void;
 };
 
 export type FilesClientOptions = {
@@ -230,7 +331,14 @@ export type FilesClientOptions = {
   busyRetries?: number;
   /** Delay before retrying a `busy` request (default 300 ms). */
   busyDelayMs?: number;
+  /** False when something between the browser and the server (an older
+   * relay) cannot carry downloads, although the server sends them. */
+  downloads?: boolean;
 };
+
+function cancelledError() {
+  return new FileError({ code: "cancelled", message: describeCode("cancelled") });
+}
 
 let serial = 0;
 function requestId(): string {
@@ -248,12 +356,15 @@ export class FilesClient {
   private timeoutMs: number;
   private busyRetries: number;
   private busyDelayMs: number;
+  private relaysDownloads: boolean;
   /** Requests sent and waiting for their reply, by identifier. */
   private running = new Map<string, Pending>();
   /** Requests waiting for a free slot, in order. */
   private queue: Pending[] = [];
   /** Requests refused as `busy`, waiting to be retried. */
   private retrying = new Set<Pending>();
+  /** Started downloads, by the server's identifier. */
+  private downloads = new Map<number, Download>();
   private stop: () => void;
   private closed = false;
 
@@ -263,6 +374,7 @@ export class FilesClient {
     this.timeoutMs = options.timeoutMs ?? 120_000;
     this.busyRetries = options.busyRetries ?? 5;
     this.busyDelayMs = options.busyDelayMs ?? 300;
+    this.relaysDownloads = options.downloads ?? true;
     this.stop = transport.listen((event) => this.event(event));
   }
 
@@ -363,6 +475,199 @@ export class FilesClient {
   delete(paths: string[]): Promise<FileRemoval> {
     return this.removal("file_delete", paths);
   }
+  /** Whether the server sends files for download (`file-downloads`). */
+  get canDownload(): boolean {
+    return this.relaysDownloads && !!this.limits.downloads;
+  }
+  /** Downloads a regular file as itself, or files and folders as one
+   * archive (`archive: "tar.gz"`; required for a folder or several paths).
+   * Bytes go to `sink.write` in order; each chunk is acknowledged once
+   * written, which paces the server. Resolves when every byte is written. */
+  download(paths: string[], options: DownloadOptions): Promise<DownloadResult> {
+    const { sink, onProgress, signal } = options;
+    if (!this.canDownload)
+      return Promise.reject(
+        new FileError({
+          code: "invalid_request",
+          message: "This server does not send files for download.",
+        }),
+      );
+    if (!paths.length || paths.length > this.limits.max_paths)
+      return Promise.reject(
+        new FileError({
+          code: "invalid_request",
+          message: `Download 1 to ${this.limits.max_paths} entries at once.`,
+        }),
+      );
+    if (signal?.aborted) return Promise.reject(cancelledError());
+    return new Promise<DownloadResult>((resolve, reject) => {
+      /** The server's identifier, once started. */
+      let id: number | undefined;
+      let start: DownloadStart | undefined;
+      let ended = false;
+      /** Bytes received (`expected`) and written and acknowledged. */
+      let expected = 0;
+      let received = 0;
+      let writes = 0;
+      let stall: ReturnType<typeof setTimeout> | undefined;
+      const state: Download = {
+        writing: Promise.resolve(),
+        event: (e) => handle(e),
+        fail: (error) => finish(error),
+      };
+      const cancelOnServer = () => {
+        if (id === undefined || this.closed) return;
+        try {
+          this.transport.send("file_download_cancel", {
+            request: requestId(),
+            download: id,
+          });
+        } catch {
+          // The connection is gone, and the download with it.
+        }
+      };
+      const finish = (error?: FileError, result?: DownloadResult) => {
+        if (ended) return;
+        ended = true;
+        clearTimeout(stall);
+        signal?.removeEventListener("abort", abort);
+        if (id !== undefined) this.downloads.delete(id);
+        if (error) reject(error);
+        else resolve(result!);
+      };
+      const failLocally = (error: FileError) => {
+        if (ended) return;
+        cancelOnServer();
+        finish(error);
+      };
+      // No event for `timeoutMs` while nothing is being written: the
+      // server or the connection stalled.
+      const arm = () => {
+        clearTimeout(stall);
+        stall = setTimeout(() => {
+          if (writes > 0) return arm();
+          failLocally(
+            new FileError({ code: "timeout", message: describeCode("timeout") }),
+          );
+        }, this.timeoutMs);
+      };
+      const abort = () => failLocally(cancelledError());
+      signal?.addEventListener("abort", abort);
+      const handle = (e: any) => {
+        if (ended) return;
+        arm();
+        if (e.type === "file_download_chunk") {
+          let bytes: Uint8Array;
+          try {
+            bytes = base64ToBytes(e.data);
+          } catch {
+            bytes = new Uint8Array();
+          }
+          if (e.offset !== expected || !bytes.length) {
+            failLocally(
+              new FileError({
+                code: "io",
+                message: "The download arrived out of order",
+              }),
+            );
+            return;
+          }
+          expected += bytes.length;
+          const end = expected;
+          const input = typeof e.input === "number" ? e.input : undefined;
+          writes += 1;
+          state.writing = state.writing
+            .then(async () => {
+              if (ended) return;
+              await sink.write(bytes);
+              if (ended) return;
+              received = end;
+              this.transport.send("file_download_ack", {
+                download: id,
+                offset: end,
+              });
+              arm();
+              onProgress?.({
+                received,
+                size: start?.size,
+                input,
+                inputBytes: start?.inputBytes,
+              });
+            })
+            .catch((error) =>
+              failLocally(
+                error instanceof FileError
+                  ? error
+                  : new FileError({
+                      code: "io",
+                      message: `The download could not be saved: ${error instanceof Error ? error.message : String(error)}`,
+                    }),
+              ),
+            )
+            .finally(() => {
+              writes -= 1;
+            });
+        } else if (e.type === "file_download_done") {
+          state.writing = state.writing.then(() => {
+            if (ended) return;
+            if (e.size !== received)
+              return failLocally(
+                new FileError({
+                  code: "io",
+                  message: "The download ended before all of its bytes arrived",
+                }),
+              );
+            finish(undefined, {
+              name: start!.name,
+              archive: start!.archive,
+              size: received,
+              hash: e.hash,
+              skipped: e.skipped || 0,
+              changed: e.changed || 0,
+            });
+          });
+        } else if (e.type === "file_error")
+          finish(new FileError(e.error || { code: "io", message: "" }));
+      };
+      const onReply = (e: any) => {
+        if (e.type !== "file_download_started") return;
+        id = e.download;
+        // Aborted while starting: stop it at once.
+        if (ended) return cancelOnServer();
+        start = {
+          name: e.name,
+          size: typeof e.size === "number" ? e.size : undefined,
+          archive: e.archive,
+          entries: e.entries,
+          inputBytes: e.input_bytes,
+        };
+        this.downloads.set(e.download, state);
+        arm();
+        const begun = start;
+        writes += 1;
+        state.writing = state.writing
+          .then(() => sink.start?.(begun))
+          .catch((error) =>
+            failLocally(
+              error instanceof FileError
+                ? error
+                : new FileError({
+                    code: "io",
+                    message: error instanceof Error ? error.message : String(error),
+                  }),
+            ),
+          )
+          .finally(() => {
+            writes -= 1;
+          });
+      };
+      const params: any = { paths };
+      if (options.archive) params.archive = options.archive;
+      this.request("file_download_begin", params, onReply).catch((error) =>
+        finish(error),
+      );
+    });
+  }
   /** Rejects every waiting call and stops listening. */
   close() {
     if (this.closed) return;
@@ -370,6 +675,9 @@ export class FilesClient {
     this.stop();
     const error = () =>
       new FileError({ code: "closed", message: describeCode("closed") });
+    for (const download of [...this.downloads.values()])
+      download.fail(error());
+    this.downloads.clear();
     for (const pending of [
       ...this.running.values(),
       ...this.queue,
@@ -399,13 +707,17 @@ export class FilesClient {
       })),
     };
   }
-  private request(type: string, params: any): Promise<any> {
+  private request(
+    type: string,
+    params: any,
+    onReply?: (event: any) => void,
+  ): Promise<any> {
     if (this.closed)
       return Promise.reject(
         new FileError({ code: "closed", message: describeCode("closed") }),
       );
     return new Promise((resolve, reject) => {
-      this.queue.push({ type, params, resolve, reject, attempts: 0 });
+      this.queue.push({ type, params, resolve, reject, attempts: 0, onReply });
       this.pump();
     });
   }
@@ -444,6 +756,20 @@ export class FilesClient {
     }
   }
   private event(e: any) {
+    // A started download's chunks, end and failure name the download.
+    if (e && typeof e.download === "number") {
+      const download = this.downloads.get(e.download);
+      if (
+        download &&
+        ["file_download_chunk", "file_download_done", "file_error"].includes(
+          e.type,
+        )
+      ) {
+        download.event(e);
+        return;
+      }
+      if (e.type === "file_download_chunk") return;
+    }
     if (!e || typeof e.request !== "string") return;
     const pending = this.running.get(e.request);
     if (!pending) return;
@@ -473,7 +799,10 @@ export class FilesClient {
         this.queue.unshift(pending);
         this.pump();
       }, this.busyDelayMs * pending.attempts);
-    } else if (outcome === "resolve") pending.resolve(e);
+    } else if (outcome === "resolve") {
+      pending.onReply?.(e);
+      pending.resolve(e);
+    }
     else pending.reject(outcome);
     this.pump();
   }

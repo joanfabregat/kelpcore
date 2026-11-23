@@ -104,6 +104,11 @@ pub fn valid_upload_path(path: &str) -> bool {
 /// its `file_limits.max_list_entries` (5,000 by default); this bound only
 /// keeps a malformed reply from growing without limit.
 const MAX_FILE_ENTRIES: usize = 200_000;
+/// Longest base64 `file_download_chunk` data. The server sends chunks of at
+/// most `file_limits.downloads.chunk_bytes` (256 KiB, about 342 KiB of
+/// base64); this bound only keeps a malformed chunk from growing without
+/// limit.
+const MAX_DOWNLOAD_CHUNK_TEXT: usize = 4 * 1024 * 1024;
 /// Most paths one `file_removed` reply may report.
 const MAX_FILE_PATHS: usize = 65_536;
 /// A path in a `files` reply: absolute, at most 4 KiB, without NUL.
@@ -442,8 +447,50 @@ impl Client {
                 }
             }
             Some("file_error") => {
-                if !valid_request(&event["request"]) || !valid_file_error(&event["error"]) {
+                if !valid_request(&event["request"])
+                    || !valid_file_error(&event["error"])
+                    || !(event["download"].is_null() || event["download"].as_u64().is_some())
+                {
                     return Err("invalid file error".into());
+                }
+            }
+            // `file-downloads`: a download's start, chunks and end.
+            Some("file_download_started") => {
+                let optional_number =
+                    |key: &str| event[key].is_null() || event[key].as_u64().is_some();
+                if !valid_request(&event["request"])
+                    || event["download"].as_u64().is_none()
+                    || event["name"].as_str().is_none_or(|name| {
+                        name.is_empty() || name.len() > 4096 || name.contains('\0')
+                    })
+                    || !optional_number("size")
+                    || !optional_number("entries")
+                    || !optional_number("input_bytes")
+                    || !(event["archive"].is_null() || event["archive"] == "tar.gz")
+                {
+                    return Err("invalid download start".into());
+                }
+            }
+            Some("file_download_chunk") => {
+                if event["download"].as_u64().is_none()
+                    || event["offset"].as_u64().is_none()
+                    || event["data"]
+                        .as_str()
+                        .is_none_or(|data| data.is_empty() || data.len() > MAX_DOWNLOAD_CHUNK_TEXT)
+                    || !(event["input"].is_null() || event["input"].as_u64().is_some())
+                {
+                    return Err("invalid download chunk".into());
+                }
+            }
+            Some("file_download_done") => {
+                if !valid_request(&event["request"])
+                    || event["download"].as_u64().is_none()
+                    || event["size"].as_u64().is_none()
+                    || !valid_hash(&event["hash"])
+                    || event["skipped"].as_u64().is_none()
+                    || event["changed"].as_u64().is_none()
+                {
+                    return Err("invalid download result".into());
                 }
             }
             Some("lease") | Some("error") => {}

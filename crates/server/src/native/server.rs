@@ -77,6 +77,32 @@ impl FileJobs {
         }
     }
 }
+/// One download as the event loop sees it: the worker's pieces are taken
+/// only while the client has window credits, and each framed message waits
+/// in `next` until the client's output queue has room.
+struct Download {
+    client: u64,
+    request: String,
+    job: super::downloads::Job,
+    /// Chunks the client may still receive before acknowledging one.
+    credits: usize,
+    /// End offsets of the chunks sent and not yet acknowledged, in order.
+    in_flight: VecDeque<u64>,
+    /// Bytes sent so far.
+    offset: u64,
+    started: bool,
+    /// A framed event waiting for room in the output queue.
+    next: Option<Vec<u8>>,
+    /// `next` is the last event (done or error).
+    finished: bool,
+}
+#[derive(Default)]
+struct Downloads {
+    active: BTreeMap<u64, Download>,
+    next: u64,
+    /// Download threads still running, cancelled ones included.
+    threads: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
 const MAX_CLIENTS: usize = 16;
 const MAX_QUEUED: usize = MAX_MESSAGE + 4;
 const MAX_PTY_WRITE: usize = 256 * 1024;
@@ -630,6 +656,15 @@ impl Client {
         }
         released
     }
+    /// Whether a download event of `len` bytes may enter the output queue:
+    /// the room file replies leave for other messages, and never ahead of a
+    /// pending screen update, which the queue's messages would otherwise
+    /// delay for as long as a download keeps refilling it.
+    fn download_room(&self, len: usize) -> bool {
+        self.update.is_none()
+            && self.output.len() < MAX_OUTPUT_MESSAGES / 2
+            && self.queued + len + FILE_REPLY_HEADROOM <= MAX_QUEUED
+    }
     /// Operation slots held by replies not yet in the output queue.
     fn held_slots(&self) -> usize {
         self.file_replies
@@ -799,6 +834,8 @@ struct Server {
     uploads: super::uploads::Uploads,
     /// File operations in progress (`files`).
     files: FileJobs,
+    /// Downloads in progress (`file-downloads`).
+    downloads: Downloads,
     next_pane: u64,
     next_client: u64,
     dirty: bool,
@@ -1447,6 +1484,29 @@ impl Server {
             | Request::FileRename { .. }
             | Request::FileTrash { .. }
             | Request::FileDelete { .. }) => return self.start_file(id, request),
+            // Downloads stream on their own threads (`poll_downloads`).
+            Request::FileDownloadBegin {
+                request,
+                paths,
+                archive,
+            } => return self.begin_download(id, request, paths, archive),
+            Request::FileDownloadAck { download, offset } => {
+                self.ack_download(id, download, offset);
+                return Ok(());
+            }
+            Request::FileDownloadCancel { request, download } => {
+                // A download that already ended (or was never this
+                // connection's) needs nothing more: `done` either way.
+                if self
+                    .downloads
+                    .active
+                    .get(&download)
+                    .is_some_and(|state| state.client == id)
+                {
+                    self.downloads.active.remove(&download);
+                }
+                return self.reply(id, Event::Done { request });
+            }
             Request::Hello { .. } => unreachable!(),
         }
         self.dirty = true;
@@ -1521,6 +1581,213 @@ impl Server {
             if !client.file_replies.is_empty() {
                 let released = client.pump_files();
                 self.files.release(*id, released);
+            }
+        }
+    }
+    /// Start a download on its own thread, within the per-connection and
+    /// per-server bounds (`busy` beyond, like other file requests).
+    fn begin_download(
+        &mut self,
+        id: u64,
+        request: String,
+        paths: Vec<String>,
+        archive: Option<super::downloads::Archive>,
+    ) -> Result<()> {
+        use super::{
+            downloads,
+            files::{self, Code, Error},
+        };
+        use std::sync::atomic::Ordering;
+        let mine = self
+            .downloads
+            .active
+            .values()
+            .filter(|state| state.client == id)
+            .count();
+        let threads = self.downloads.threads.load(Ordering::Relaxed);
+        let refusal =
+            if mine >= downloads::MAX_DOWNLOADS || threads >= downloads::MAX_SERVER_DOWNLOADS {
+                Error::new(
+                    Code::Busy,
+                    format!(
+                        "at most {} downloads per connection and {} per server run at once",
+                        downloads::MAX_DOWNLOADS,
+                        downloads::MAX_SERVER_DOWNLOADS
+                    ),
+                )
+            } else {
+                match downloads::start(paths, archive, &self.downloads.threads) {
+                    Ok(job) => {
+                        self.downloads.next += 1;
+                        self.downloads.active.insert(
+                            self.downloads.next,
+                            Download {
+                                client: id,
+                                request,
+                                job,
+                                credits: downloads::MAX_CHUNKS_IN_FLIGHT,
+                                in_flight: VecDeque::new(),
+                                offset: 0,
+                                started: false,
+                                next: None,
+                                finished: false,
+                            },
+                        );
+                        return Ok(());
+                    }
+                    Err(error) => Error::new(Code::Io, error.to_string()),
+                }
+            };
+        let client = self.clients.get_mut(&id).ok_or("unknown client")?;
+        if !client.hold_file_reply(files::failure(request, refusal), false) {
+            return Err("slow native client".into());
+        }
+        let released = client.pump_files();
+        self.files.release(id, released);
+        Ok(())
+    }
+    /// One acknowledged chunk returns one credit. An acknowledgement that
+    /// is not the oldest chunk's end fails the download; one for a download
+    /// that ended, or another connection's, is ignored.
+    fn ack_download(&mut self, id: u64, download: u64, offset: u64) {
+        let Some(state) = self.downloads.active.get_mut(&download) else {
+            return;
+        };
+        if state.client != id || state.finished {
+            return;
+        }
+        if state.in_flight.front() == Some(&offset) {
+            state.in_flight.pop_front();
+            state.credits += 1;
+            return;
+        }
+        let error = super::files::Error::new(
+            super::files::Code::InvalidRequest,
+            "acknowledgement out of order: acknowledge each chunk's end offset in order",
+        );
+        let event = super::stream::Event::FileError {
+            request: state.request.clone(),
+            error,
+            download: Some(download),
+        };
+        // The chunk waiting to be queued is dropped with the download.
+        state.next = wire(&ServerMessage::Stream(event)).ok();
+        state.finished = true;
+        if state.next.is_none() {
+            self.downloads.active.remove(&download);
+        }
+    }
+    /// Move downloads forward: take the worker's pieces while the client has
+    /// credits, and queue each framed event once the output queue has room.
+    fn poll_downloads(&mut self) {
+        use super::{downloads::Piece, stream::Event};
+        use base64::{Engine, engine::general_purpose::STANDARD};
+        let ids: Vec<u64> = self.downloads.active.keys().copied().collect();
+        for download in ids {
+            let state = self.downloads.active.get_mut(&download).unwrap();
+            let Some(client) = self.clients.get_mut(&state.client) else {
+                self.downloads.active.remove(&download);
+                continue;
+            };
+            let mut remove = false;
+            // Bounded work per connection and loop: a window's worth.
+            for _ in 0..super::downloads::MAX_CHUNKS_IN_FLIGHT + 2 {
+                if let Some(bytes) = state.next.take() {
+                    if !client.download_room(bytes.len()) {
+                        state.next = Some(bytes);
+                        break;
+                    }
+                    client.queued += bytes.len();
+                    client.output.push_back(bytes);
+                    if state.finished {
+                        remove = true;
+                        break;
+                    }
+                    continue;
+                }
+                if state.finished {
+                    remove = true;
+                    break;
+                }
+                if state.started && state.credits == 0 {
+                    break;
+                }
+                let piece = match state.job.receiver.try_recv() {
+                    Ok(piece) => piece,
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        Piece::Failed(super::files::Error::new(
+                            super::files::Code::Io,
+                            "the download stopped unexpectedly",
+                        ))
+                    }
+                };
+                let event = match piece {
+                    Piece::Started {
+                        name,
+                        size,
+                        archive,
+                        entries,
+                        input_bytes,
+                    } => {
+                        state.started = true;
+                        Event::FileDownloadStarted {
+                            request: state.request.clone(),
+                            download,
+                            name,
+                            size,
+                            archive,
+                            entries,
+                            input_bytes,
+                        }
+                    }
+                    Piece::Chunk { data, input } => {
+                        let offset = state.offset;
+                        state.offset += data.len() as u64;
+                        state.credits -= 1;
+                        state.in_flight.push_back(state.offset);
+                        Event::FileDownloadChunk {
+                            download,
+                            offset,
+                            data: STANDARD.encode(&data),
+                            input,
+                        }
+                    }
+                    Piece::Done {
+                        size,
+                        hash,
+                        skipped,
+                        changed,
+                    } => {
+                        state.finished = true;
+                        Event::FileDownloadDone {
+                            request: state.request.clone(),
+                            download,
+                            size,
+                            hash,
+                            skipped,
+                            changed,
+                        }
+                    }
+                    Piece::Failed(error) => {
+                        state.finished = true;
+                        Event::FileError {
+                            request: state.request.clone(),
+                            error,
+                            download: state.started.then_some(download),
+                        }
+                    }
+                };
+                match wire(&ServerMessage::Stream(event)) {
+                    Ok(bytes) => state.next = Some(bytes),
+                    Err(_) => {
+                        remove = true;
+                        break;
+                    }
+                }
+            }
+            if remove {
+                self.downloads.active.remove(&download);
             }
         }
     }
@@ -2413,6 +2680,8 @@ impl Server {
             // still running release theirs when they finish.
             self.files.release(id, client.held_slots());
         }
+        // Dropping a download cancels its thread.
+        self.downloads.active.retain(|_, state| state.client != id);
         self.uploads.disconnect(id);
         self.recovery_waiters.retain(|(client, _)| *client != id);
         let before = self.leases.len();
@@ -2532,6 +2801,7 @@ pub fn serve(config: ServerConfig) -> Result<()> {
         clients: BTreeMap::new(),
         uploads,
         files: FileJobs::new(),
+        downloads: Downloads::default(),
         next_pane: 1,
         spawn_requests: BTreeMap::new(),
         unused_shells: Default::default(),
@@ -2626,6 +2896,7 @@ pub fn serve(config: ServerConfig) -> Result<()> {
         server.poll_ptys();
         server.poll_recovery();
         server.poll_files();
+        server.poll_downloads();
         server.uploads.sweep_due();
         let streaming = server
             .clients

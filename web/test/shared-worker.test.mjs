@@ -746,3 +746,75 @@ test("file requests are relayed and each reply reaches only the window that aske
   assert.equal(events(b, "file_stat").length, 0);
   assert.equal(events(a, "file_stat").length, 0);
 });
+
+test("a download's chunks reach only the window that began it", async () => {
+  const h = harness({ extra: { capabilities: ["files", "file-downloads"] } });
+  const a = h.attach(),
+    b = h.attach();
+  await h.join(a);
+  await h.join(b);
+  const events = (view, type) =>
+    view.messages.filter((m) => m.event?.Stream?.type === type);
+  const host = (event) =>
+    h.send(a, { type: "host_event", event: { Stream: event } });
+  const sent = (type) => h.calls.filter((call) => call.type === type);
+  const request = (view, type, params) =>
+    h.send(view, { type: "request", request: type, params });
+
+  await request(b, "file_download_begin", {
+    request: "file-b-1",
+    paths: ["/home/me/a"],
+  });
+  assert.equal(sent("file_download_begin").length, 1);
+  await host({
+    type: "file_download_started",
+    request: "file-b-1",
+    download: 4,
+    name: "a",
+    size: 3,
+  });
+  assert.equal(events(b, "file_download_started").length, 1);
+  await host({ type: "file_download_chunk", download: 4, offset: 0, data: "YWJj" });
+  assert.equal(events(b, "file_download_chunk").length, 1);
+  assert.equal(events(a, "file_download_chunk").length, 0, "another window's");
+  // Only the window that began it acknowledges or cancels it.
+  await request(a, "file_download_ack", { download: 4, offset: 3 });
+  assert.equal(sent("file_download_ack").length, 0);
+  await request(b, "file_download_ack", { download: 4, offset: 3 });
+  assert.deepEqual({ ...sent("file_download_ack")[0].params }, { download: 4, offset: 3 });
+  await request(a, "file_download_cancel", { request: "file-a-9", download: 4 });
+  assert.equal(sent("file_download_cancel").length, 0);
+  await host({
+    type: "file_download_done",
+    request: "file-b-1",
+    download: 4,
+    size: 3,
+    hash: "a".repeat(64),
+    skipped: 0,
+    changed: 0,
+  });
+  assert.equal(events(b, "file_download_done").length, 1);
+  assert.equal(events(a, "file_download_done").length, 0);
+  // Late events of an ended download are dropped, never broadcast.
+  await host({ type: "file_download_chunk", download: 4, offset: 3, data: "YQ==" });
+  assert.equal(events(a, "file_download_chunk").length + events(b, "file_download_chunk").length, 1);
+
+  // A window that leaves cancels its downloads.
+  await request(b, "file_download_begin", {
+    request: "file-b-2",
+    paths: ["/home/me/big"],
+  });
+  await host({
+    type: "file_download_started",
+    request: "file-b-2",
+    download: 5,
+    name: "big",
+  });
+  await h.send(b, { type: "leave" });
+  const cancel = sent("file_download_cancel").at(-1);
+  assert.equal(cancel.params.download, 5);
+  await host({ type: "done", request: cancel.params.request });
+  await host({ type: "file_download_chunk", download: 5, offset: 0, data: "YQ==" });
+  assert.equal(events(a, "done").length, 0);
+  assert.equal(events(a, "file_download_chunk").length, 0);
+});

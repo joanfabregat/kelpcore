@@ -38,6 +38,7 @@ import {
   queueLimit,
   requestLimit,
 } from "../src/request-limits.ts";
+import { downloadName } from "../src/files/save.ts";
 
 const limits = {
   max_read_bytes: 8388608,
@@ -493,4 +494,185 @@ test("a file write may exceed the ordinary request limits, nothing else may", ()
   assert.ok(fileWriteLimit >= 6 * fileContentLimit);
   assert.ok(fileWriteLimit < 16 * 2 ** 20, "within one stream record");
   assert.ok(queueLimit(write) > queueLimit(input));
+});
+
+const downloadLimits = {
+  chunk_bytes: 4,
+  max_chunks_in_flight: 2,
+  max_downloads: 2,
+  max_archive_entries: 100000,
+  max_archive_bytes: 17179869184,
+};
+const b64 = (text) => Buffer.from(text).toString("base64");
+
+test("download limits are optional within the file limits", async () => {
+  assert.equal(readFileLimits(limits).downloads, undefined);
+  const client = new FilesClient(fakeTransport().transport, { limits });
+  assert.equal(client.canDownload, false);
+  const read = readFileLimits({ ...limits, downloads: downloadLimits });
+  assert.deepEqual(read.downloads, downloadLimits);
+  // Malformed download limits leave the rest usable, without downloads.
+  const partial = readFileLimits({
+    ...limits,
+    downloads: { ...downloadLimits, chunk_bytes: 0 },
+  });
+  assert.equal(partial.downloads, undefined);
+  assert.equal(partial.max_paths, 256);
+  // A relay that cannot carry downloads turns them off.
+  const relayed = new FilesClient(fakeTransport().transport, {
+    limits: read,
+    downloads: false,
+  });
+  assert.equal(relayed.canDownload, false);
+  await assert.rejects(relayed.download(["/a"], { sink: { write() {} } }), {
+    code: "invalid_request",
+  });
+});
+
+test("a download writes its chunks in order and acknowledges each once written", async () => {
+  const t = fakeTransport();
+  const client = new FilesClient(t.transport, {
+    limits: { ...limits, downloads: downloadLimits },
+  });
+  assert.equal(client.canDownload, true);
+  const written = [];
+  const progress = [];
+  let release;
+  const starts = [];
+  const result = client.download(["/home/me/a.txt"], {
+    sink: {
+      start: (start) => starts.push(start),
+      // The first write waits: its acknowledgement must wait too.
+      write: (bytes) =>
+        written.push(Buffer.from(bytes).toString()) === 1
+          ? new Promise((resolve) => (release = resolve))
+          : undefined,
+    },
+    onProgress: (p) => progress.push(p),
+  });
+  await tick();
+  const begin = t.sent[0];
+  assert.equal(begin.type, "file_download_begin");
+  assert.deepEqual(begin.paths, ["/home/me/a.txt"]);
+  assert.equal(begin.archive, undefined);
+  t.reply({
+    type: "file_download_started",
+    request: begin.request,
+    download: 7,
+    name: "a.txt",
+    size: 6,
+  });
+  // Chunks of another download, or out of the blue, are ignored.
+  t.reply({ type: "file_download_chunk", download: 8, offset: 0, data: b64("x") });
+  t.reply({ type: "file_download_chunk", download: 7, offset: 0, data: b64("abc") });
+  t.reply({ type: "file_download_chunk", download: 7, offset: 3, data: b64("def") });
+  await tick();
+  assert.deepEqual(starts, [{ name: "a.txt", size: 6, archive: undefined, entries: undefined, inputBytes: undefined }]);
+  assert.deepEqual(written, ["abc"]);
+  assert.equal(t.sent.filter((r) => r.type === "file_download_ack").length, 0);
+  release();
+  await tick();
+  assert.deepEqual(written, ["abc", "def"]);
+  assert.deepEqual(
+    t.sent.filter((r) => r.type === "file_download_ack"),
+    [
+      { type: "file_download_ack", download: 7, offset: 3 },
+      { type: "file_download_ack", download: 7, offset: 6 },
+    ],
+  );
+  t.reply({
+    type: "file_download_done",
+    request: begin.request,
+    download: 7,
+    size: 6,
+    hash,
+    skipped: 0,
+    changed: 0,
+  });
+  assert.deepEqual(await result, {
+    name: "a.txt",
+    archive: undefined,
+    size: 6,
+    hash,
+    skipped: 0,
+    changed: 0,
+  });
+  assert.deepEqual(
+    progress.map((p) => [p.received, p.size]),
+    [
+      [3, 6],
+      [6, 6],
+    ],
+  );
+});
+
+test("a download can fail, be refused or be cancelled", async () => {
+  const t = fakeTransport();
+  const client = new FilesClient(t.transport, {
+    limits: { ...limits, downloads: downloadLimits },
+  });
+  const sink = { write() {} };
+  // Refused before it starts.
+  const refused = client.download(["/home/me/dir"], { sink });
+  await tick();
+  t.reply({
+    type: "file_error",
+    request: t.sent.at(-1).request,
+    error: { code: "is_a_directory", message: "a folder downloads only as an archive" },
+  });
+  await assert.rejects(refused, (e) => e.code === "is_a_directory");
+  // Fails part way: the server names the download.
+  const failed = client.download(["/home/me/src"], { sink, archive: "tar.gz" });
+  await tick();
+  assert.equal(t.sent.at(-1).archive, "tar.gz");
+  const request = t.sent.at(-1).request;
+  t.reply({ type: "file_download_started", request, download: 9, name: "src.tar.gz", archive: "tar.gz", entries: 3, input_bytes: 10 });
+  t.reply({ type: "file_error", request, download: 9, error: { code: "too_large", message: "grew" } });
+  await assert.rejects(failed, (e) => e.code === "too_large");
+  // Cancelled by the caller: the server is told, the call rejects.
+  const abort = new AbortController();
+  const cancelled = client.download(["/home/me/big"], { sink, signal: abort.signal });
+  await tick();
+  t.reply({ type: "file_download_started", request: t.sent.at(-1).request, download: 10, name: "big", size: 99 });
+  t.reply({ type: "file_download_chunk", download: 10, offset: 0, data: b64("abcd") });
+  abort.abort();
+  await assert.rejects(cancelled, (e) => e.code === "cancelled");
+  const cancel = t.sent.filter((r) => r.type === "file_download_cancel");
+  assert.equal(cancel.length, 1);
+  assert.equal(cancel[0].download, 10);
+  // A failing sink cancels too.
+  const broken = client.download(["/home/me/big"], {
+    sink: {
+      write() {
+        throw Error("disk full");
+      },
+    },
+  });
+  await tick();
+  t.reply({ type: "file_download_started", request: t.sent.at(-1).request, download: 11, name: "big", size: 99 });
+  t.reply({ type: "file_download_chunk", download: 11, offset: 0, data: b64("abcd") });
+  await assert.rejects(broken, (e) => e.code === "io" && /disk full/.test(e.message));
+  assert.equal(t.sent.filter((r) => r.type === "file_download_cancel").at(-1).download, 11);
+  // A chunk out of order fails the download.
+  const disorder = client.download(["/home/me/big"], { sink });
+  await tick();
+  t.reply({ type: "file_download_started", request: t.sent.at(-1).request, download: 12, name: "big" });
+  t.reply({ type: "file_download_chunk", download: 12, offset: 4, data: b64("abcd") });
+  await assert.rejects(disorder, (e) => e.code === "io");
+  // Without the server's support nothing is sent.
+  const plain = new FilesClient(fakeTransport().transport, { limits });
+  await assert.rejects(plain.download(["/a"], { sink }), (e) => e.code === "invalid_request");
+  // Closing the client rejects a running download.
+  const open = client.download(["/home/me/big"], { sink });
+  await tick();
+  t.reply({ type: "file_download_started", request: t.sent.at(-1).request, download: 13, name: "big" });
+  client.close();
+  await assert.rejects(open, (e) => e.code === "closed");
+});
+
+test("downloads are offered under the file's or the folder's name", () => {
+  assert.equal(downloadName(["/home/me/a.txt"]), "a.txt");
+  assert.equal(downloadName(["/home/me/src"], "tar.gz"), "src.tar.gz");
+  assert.equal(downloadName(["/home/me/a", "/home/me/b"], "tar.gz"), "me.tar.gz");
+  assert.equal(downloadName(["/a/x", "/b/y"], "tar.gz"), "download.tar.gz");
 });

@@ -405,6 +405,66 @@ For both, the paths (1 to `max_paths`) are validated first: one invalid path ref
 
 **Threading.** File requests run on worker threads, so a slow disk or a large delete never delays pane output. Replies may therefore arrive in a different order than the requests and between other events; match them by `request`. A reply that does not fit the connection's output queue (several large reads finishing together, or a burst of `busy` refusals) waits for the queue to drain instead of disconnecting the client; a connection with more than 256 refusals waiting is disconnected as a slow peer. Running requests cannot be cancelled: one stuck on an unresponsive file system (a hung network mount) keeps its slot until the system call returns, and enough of them make every file request answer `busy` until it does or the server restarts. A server stopping while a request runs does not wait for it, and its reply is lost (a delete may then be partial).
 
+### Downloads (`file-downloads`)
+
+A client saves files from the server host on the user's computer: a single regular file as itself, or files and folders as one gzip-compressed tar archive (`.tar.gz`). The server streams the bytes in chunks that the client acknowledges, the reverse of uploads, so nothing is built whole in memory or on disk and a slow client slows its download, never the server. Downloads are an addition to `files`: same authorization, same paths, same errors. ADR 0003 section 3 ([KelpCore ADR 0003](../../../docs/adr/0003-kelpcore-shared-repository.md)).
+
+**Limits.** A server with the capability adds `downloads` to Welcome `file_limits`; a client offers downloads only when both are present:
+
+```json
+{"Stream":{"type":"welcome",…,"capabilities":[…,"files","file-downloads"],"file_limits":{…,"downloads":{"chunk_bytes":262144,"max_chunks_in_flight":8,"max_downloads":2,"max_archive_entries":100000,"max_archive_bytes":17179869184}}}}
+```
+
+- `chunk_bytes`: decoded bytes per chunk (256 KiB, about 342 KiB of base64, like an upload chunk).
+- `max_chunks_in_flight`: the flow-control window (8), below.
+- `max_downloads`: unfinished downloads per connection (2). The server runs at most 8 download threads in total, counting cancelled downloads whose thread has not returned yet. A download over a bound gets `file_error` `busy` at once. Downloads do not take the `max_in_flight` slots of other file requests, so browsing stays responsive during a long download.
+- `max_archive_entries`: files, folders and symlinks in one archive (100,000); `max_archive_bytes`: the sum of the archived files' sizes (16 GiB). Folders nest at most `max_depth` levels (64). A single file has no size bound.
+
+**Begin.**
+
+```json
+{"Stream":{"type":"file_download_begin","request":"d1","paths":["/home/me/notes.pdf"]}}
+{"Stream":{"type":"file_download_started","request":"d1","download":1,"name":"notes.pdf","size":48213}}
+{"Stream":{"type":"file_download_begin","request":"d2","paths":["~/project"],"archive":"tar.gz"}}
+{"Stream":{"type":"file_download_started","request":"d2","download":2,"name":"project.tar.gz","archive":"tar.gz","entries":214,"input_bytes":3811077}}
+```
+
+Without `archive`, `paths` names exactly one regular file. It is opened like `file_read` opens one: a final symlink is followed, the type is checked before the file is opened (`is_a_directory` for a folder, `not_a_file` for a FIFO, socket or device, which is never opened), then checked again on the open descriptor. `size` is its size when opened; the bytes sent are whatever the file holds when read, so `file_download_done.size` can differ if the file changed.
+
+With `"archive":"tar.gz"`, `paths` (1 to `max_paths`) name files, folders or symlinks, each archived under its own name (a folder with its whole tree below it); two selected entries with the same name are refused (`invalid_request`). Before the first byte, a planning walk counts the entries and input bytes and refuses an archive over the bounds or `max_depth` with `too_large`, so a client learns that before saving anything. `entries` and `input_bytes` report what it found; chunks of an archive carry `input`, the input bytes read so far, for progress (the compressed size is not known in advance). `name` is the suggested file name: the file's name, `<folder>.tar.gz`, `<name>.tar.gz` for one selected file or symlink, `<their folder>.tar.gz` for several entries of one folder, or `download.tar.gz`.
+
+`download` is a number unique within the server run, addressed only by the connection that began the download. Failures before the start (paths, types, bounds, `busy`) are `file_error {request, error}` without `download`, as for every file request.
+
+**Chunks and flow control.**
+
+```json
+{"Stream":{"type":"file_download_chunk","download":2,"offset":0,"data":"H4sIAAAAAAAA/+y9…","input":262144}}
+{"Stream":{"type":"file_download_ack","download":2,"offset":262144}}
+```
+
+`data` is standard padded base64 of 1 to `chunk_bytes` bytes at `offset`; chunks arrive in order at contiguous offsets. **Flow-control rule:** the server sends at most `max_chunks_in_flight` chunks that are not acknowledged; the client acknowledges each chunk, in order, with its end offset (`offset` + its length, the bytes received so far), and should do so once it has stored the chunk, so a slow disk or a busy page slows the server rather than filling memory. An acknowledgement that is not the oldest unacknowledged chunk's end fails the download (`file_error` `invalid_request` with `download`); one for a download that ended, or of another connection, is ignored. Acknowledgements carry no `request` and get no reply. The server takes a chunk from the reading thread only while the window and the connection's output queue have room, and never ahead of a pending screen update, so a download neither disconnects its client nor delays pane updates by more than a window.
+
+**End.**
+
+```json
+{"Stream":{"type":"file_download_done","request":"d2","download":2,"size":1094730,"hash":"9a0c…","skipped":1,"changed":0}}
+```
+
+`size` and `hash` (lowercase hexadecimal SHA-256) cover the bytes sent, so a client can check what it saved. `skipped` counts archive entries left out: devices, FIFOs and sockets (never opened), entries the server's user may not read (permission denied on a file or folder), and the contents of mount points. `changed` counts files that changed size or modification time while being read. A failure after the start (an I/O error, an archive that grew past a bound while streaming) is `file_error {request, download, error}`; nothing more follows for that download, and the client discards what it received.
+
+**Cancel.**
+
+```json
+{"Stream":{"type":"file_download_cancel","request":"d3","download":2}}
+{"Stream":{"type":"done","request":"d3"}}
+```
+
+stops the download: no further event of it follows the `done` (chunks queued before it are still delivered first). Cancelling a download that already ended, or one this connection never had, also replies `done`. A disconnect cancels the connection's downloads. The reading thread stops at its next read or chunk; one stuck on an unresponsive file system keeps its server-wide thread slot until the system call returns.
+
+**Archive format.** POSIX tar (ustar headers), gzip-compressed (deflate level 2, streamed). A pax extended header (`x`) carries the `path` of an entry whose name is longer than 100 bytes or not printable ASCII, the `linkpath` of such a symlink target, a `size` of 8 GiB or more, and an `mtime` before 1970 or past the octal field; GNU tar, bsdtar, 7-Zip and Python's `tarfile` read them. Folders (`5`, name ending in `/`) precede their contents; each folder's entries are in byte order of their names. Entries carry the permission bits (`mode & 0o777`, without set-id or sticky bits) and the modification time in seconds; owner and group are 0 with empty names, so the archive does not disclose the server's account names, and an extracting user owns what they extract. The walk never follows a symlink: symlinks are stored as links (`2`) with their target text, and folders and files are opened through their parent's descriptor with `O_NOFOLLOW`. It never enters another file system: a mount point inside a folder is stored as an empty folder and counted in `skipped`, like `tar --one-file-system`. A file's header records its size when it is opened: a file that grows while being read is cut at that size, one that shrinks is padded with zero bytes, and both count in `changed`, so the archive always stays well formed. An entry that disappears between the listing and its turn is left out silently. An archive that grows past a bound while streaming fails with `too_large` (no partial archive is ever reported as done).
+
+**Threading.** Each download runs on its own thread, which reads files and compresses; the event loop only moves finished chunks to the connection, so pane output is never delayed by a slow disk or by compression.
+
 ### Parking and hidden panes
 
 The server has no parking concept. A client that hides a pane unsubscribes from it and either keeps its lease, so its size stays fixed while hidden, or releases it, so the pane returns to the server's base size.

@@ -152,7 +152,10 @@ impl State {
             | Event::FileContent { .. }
             | Event::FileWritten { .. }
             | Event::FileRemoved { .. }
-            | Event::FileError { .. } => {}
+            | Event::FileError { .. }
+            | Event::FileDownloadStarted { .. }
+            | Event::FileDownloadChunk { .. }
+            | Event::FileDownloadDone { .. } => {}
         }
         Ok(())
     }
