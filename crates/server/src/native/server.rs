@@ -38,6 +38,25 @@ pub struct ServerConfig {
     pub rows: u16,
     /// Upload directory and retention (`uploads`).
     pub uploads: super::uploads::Settings,
+    /// File operations (`files`): the trash location.
+    pub files: super::files::Settings,
+}
+/// File operations running on worker threads, counted per connection until
+/// their reply is delivered (or dropped after a disconnect).
+struct FileJobs {
+    running: BTreeMap<u64, usize>,
+    sender: std::sync::mpsc::Sender<(u64, super::stream::Event)>,
+    receiver: std::sync::mpsc::Receiver<(u64, super::stream::Event)>,
+}
+impl FileJobs {
+    fn new() -> Self {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        Self {
+            running: BTreeMap::new(),
+            sender,
+            receiver,
+        }
+    }
 }
 const MAX_CLIENTS: usize = 16;
 const MAX_QUEUED: usize = MAX_MESSAGE + 4;
@@ -670,6 +689,8 @@ struct Server {
     clients: BTreeMap<u64, Client>,
     /// Unfinished upload batches and the upload registry.
     uploads: super::uploads::Uploads,
+    /// File operations in progress (`files`).
+    files: FileJobs,
     next_pane: u64,
     next_client: u64,
     dirty: bool,
@@ -852,6 +873,7 @@ impl Server {
                 limits: Some(super::stream::LIMITS),
                 notification_run: Some(self.activity.run().to_owned()),
                 upload_limits: Some(super::uploads::LIMITS),
+                file_limits: Some(super::files::LIMITS),
             };
             let client = self.clients.get_mut(&id).unwrap();
             if client.stream.is_some() {
@@ -1307,10 +1329,77 @@ impl Server {
                 self.uploads.cancel(id, batch)?;
                 return self.reply(id, Event::Done { request });
             }
+            // File operations change no pane state either, and carry the same
+            // trust as uploads. They run on worker threads (`poll_files`).
+            request @ (Request::FileList { .. }
+            | Request::FileStat { .. }
+            | Request::FileRead { .. }
+            | Request::FileWrite { .. }
+            | Request::FileMkdir { .. }
+            | Request::FileRename { .. }
+            | Request::FileTrash { .. }
+            | Request::FileDelete { .. }) => return self.start_file(id, request),
             Request::Hello { .. } => unreachable!(),
         }
         self.dirty = true;
         Ok(())
+    }
+    /// Run a file request on a worker thread, within the per-connection and
+    /// per-server bounds; the reply is delivered by `poll_files`.
+    fn start_file(&mut self, id: u64, request: super::stream::Request) -> Result<()> {
+        use super::files::{self, Code, Error};
+        let correlation = request.correlation().unwrap_or_default().to_owned();
+        let running = self.files.running.get(&id).copied().unwrap_or(0);
+        let total: usize = self.files.running.values().sum();
+        if running >= files::MAX_IN_FLIGHT || total >= files::MAX_SERVER_IN_FLIGHT {
+            return self.reply(
+                id,
+                files::failure(
+                    correlation,
+                    Error::new(
+                        Code::Busy,
+                        format!(
+                            "at most {} file operations per connection and {} per server run at once",
+                            files::MAX_IN_FLIGHT,
+                            files::MAX_SERVER_IN_FLIGHT
+                        ),
+                    ),
+                ),
+            );
+        }
+        let sender = self.files.sender.clone();
+        let settings = self.config.files.clone();
+        let spawned = std::thread::Builder::new()
+            .name("kelpserver-files".into())
+            .spawn(move || {
+                let _ = sender.send((id, files::execute(request, &settings)));
+            });
+        if let Err(error) = spawned {
+            return self.reply(
+                id,
+                files::failure(correlation, Error::new(Code::Busy, error.to_string())),
+            );
+        }
+        *self.files.running.entry(id).or_default() += 1;
+        Ok(())
+    }
+    /// Deliver finished file operations to their connections.
+    fn poll_files(&mut self) {
+        while let Ok((id, event)) = self.files.receiver.try_recv() {
+            if let Some(running) = self.files.running.get_mut(&id) {
+                *running -= 1;
+                if *running == 0 {
+                    self.files.running.remove(&id);
+                }
+            }
+            if let Some(client) = self.clients.get_mut(&id) {
+                // A connection that cannot take a reliable reply is a slow
+                // peer; the next flush disconnects it.
+                if client.send(ServerMessage::Stream(event)).is_err() {
+                    client.failed = true;
+                }
+            }
+        }
     }
     fn reply(&mut self, id: u64, event: super::stream::Event) -> Result<()> {
         self.clients
@@ -2297,6 +2386,7 @@ pub fn serve(config: ServerConfig) -> Result<()> {
         panes: BTreeMap::new(),
         clients: BTreeMap::new(),
         uploads,
+        files: FileJobs::new(),
         next_pane: 1,
         spawn_requests: BTreeMap::new(),
         unused_shells: Default::default(),
@@ -2359,6 +2449,7 @@ pub fn serve(config: ServerConfig) -> Result<()> {
         }
         server.poll_ptys();
         server.poll_recovery();
+        server.poll_files();
         server.uploads.sweep_due();
         let streaming = server
             .clients

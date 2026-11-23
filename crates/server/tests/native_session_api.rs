@@ -54,6 +54,7 @@ impl Daemon {
             cols: 100,
             rows: 30,
             uploads: Default::default(),
+            files: Default::default(),
         };
         let handle = thread::spawn(move || serve(config));
         let daemon = Self {

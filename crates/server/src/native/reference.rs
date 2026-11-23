@@ -145,7 +145,14 @@ impl State {
             Event::UploadStarted { .. }
             | Event::UploadProgress { .. }
             | Event::UploadDone { .. }
-            | Event::UploadFailed { .. } => {}
+            | Event::UploadFailed { .. }
+            // File replies likewise.
+            | Event::FileList { .. }
+            | Event::FileStat { .. }
+            | Event::FileContent { .. }
+            | Event::FileWritten { .. }
+            | Event::FileRemoved { .. }
+            | Event::FileError { .. } => {}
         }
         Ok(())
     }

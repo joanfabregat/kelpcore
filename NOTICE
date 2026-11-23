@@ -22,3 +22,9 @@ not part of this repository.
 Native status-bar metrics incorporate code adapted from Vitals
 (https://github.com/joanfabregat/vitals), Copyright (c) 2026 Joan Fabrégat,
 licensed under MIT. The complete license is in assets/licenses/vitals-MIT.txt.
+
+The file operations (crates/server/src/native/files.rs) adapt the design and
+parts of the code of KelpHub's workspace file browser
+(server/src/management/files.rs at commit ed69304), Copyright 2026 Joan
+Fabregat, moved into KelpCore under the Apache License, Version 2.0, with
+the copyright holder's approval.

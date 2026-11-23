@@ -29,8 +29,8 @@
 //! an unknown request type. Step 2 of ADR 0002 added `startup-policy`,
 //! `recovery-signal`, `spawn-shell`, `unused-shell`, `stream-limits`,
 //! `notification-run` and `spawned-by` the same way, and decision 151a added
-//! `uploads` (see `super::uploads`). Device/MCP capabilities
-//! remain deferred.
+//! `uploads` (see `super::uploads`), and ADR 0003 section 3 added `files`
+//! (see `super::files`). Device/MCP capabilities remain deferred.
 //!
 //! `binary-screens` (ADR 0003 section 2): after `binary_screens {enabled:
 //! true}`, each Update to that connection has `binary_screens: true`, empty
@@ -151,6 +151,7 @@ pub const CAPABILITIES: &[&str] = &[
     "diagnostics",
     "uploads",
     "binary-screens",
+    "files",
 ];
 /// Aggregate context budget of one multi-pane `search` reply.
 pub const MAX_SEARCH_CONTEXT: usize = 4 * 1024 * 1024;
@@ -329,6 +330,64 @@ pub enum Request {
         request: String,
         batch: u64,
     },
+    /// `files`: a directory's entries (`file_list` reply). Paths are
+    /// absolute or start with `~/` (see `super::files::normalize`).
+    FileList {
+        request: String,
+        path: String,
+    },
+    /// `files`: one entry, not following a final symlink (`file_stat` reply).
+    FileStat {
+        request: String,
+        path: String,
+    },
+    /// `files`: a regular file's content (`file_content` reply), at most
+    /// `max_bytes` (default and cap: `file_limits.max_read_bytes`).
+    FileRead {
+        request: String,
+        path: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_bytes: Option<u64>,
+    },
+    /// `files`: replace a file atomically, or create it with `create`
+    /// (`file_written` reply). With `base_hash`, a file whose current
+    /// SHA-256 differs is not written (`file_error` `conflict`).
+    FileWrite {
+        request: String,
+        path: String,
+        content: String,
+        #[serde(default)]
+        encoding: super::files::Encoding,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        base_hash: Option<String>,
+        #[serde(default)]
+        create: bool,
+    },
+    /// `files`: create one directory (`done` reply).
+    FileMkdir {
+        request: String,
+        path: String,
+    },
+    /// `files`: rename or move within one file system (`done` reply). An
+    /// existing `to` is replaced only with `overwrite`.
+    FileRename {
+        request: String,
+        from: String,
+        to: String,
+        #[serde(default)]
+        overwrite: bool,
+    },
+    /// `files`: move entries to the freedesktop home trash (`file_removed`).
+    FileTrash {
+        request: String,
+        paths: Vec<String>,
+    },
+    /// `files`: delete entries permanently, directories recursively, never
+    /// following a symlink (`file_removed`).
+    FileDelete {
+        request: String,
+        paths: Vec<String>,
+    },
 }
 impl Request {
     /// The correlation identifier echoed by this request's reply and errors.
@@ -345,7 +404,15 @@ impl Request {
             | Self::Diagnostics { request }
             | Self::UploadBegin { request, .. }
             | Self::UploadFinish { request, .. }
-            | Self::UploadCancel { request, .. } => Some(request),
+            | Self::UploadCancel { request, .. }
+            | Self::FileList { request, .. }
+            | Self::FileStat { request, .. }
+            | Self::FileRead { request, .. }
+            | Self::FileWrite { request, .. }
+            | Self::FileMkdir { request, .. }
+            | Self::FileRename { request, .. }
+            | Self::FileTrash { request, .. }
+            | Self::FileDelete { request, .. } => Some(request),
             _ => None,
         }
     }
@@ -501,6 +568,9 @@ pub enum Event {
         /// Upload bounds and the flow-control window (`uploads`).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         upload_limits: Option<super::uploads::Limits>,
+        /// File operation bounds (`files`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        file_limits: Option<super::files::Limits>,
     },
     Update(Update),
     Lease {
@@ -595,6 +665,56 @@ pub enum Event {
         batch: u64,
         message: String,
     },
+    /// `files`: the entries of `path` (normalised), directories first, then
+    /// by name. `truncated` when entries were left out by the bounds;
+    /// `skipped` counts names that are not UTF-8.
+    FileList {
+        request: String,
+        path: String,
+        entries: Vec<super::files::Entry>,
+        truncated: bool,
+        skipped: usize,
+    },
+    /// `files`: one entry (`lstat`).
+    FileStat {
+        request: String,
+        path: String,
+        entry: super::files::Entry,
+    },
+    /// `files`: a regular file's whole content and its SHA-256 (`hash`,
+    /// lowercase hex), the `base_hash` of a later `file_write`.
+    FileContent {
+        request: String,
+        path: String,
+        size: u64,
+        modified: i64,
+        mode: u32,
+        hash: String,
+        /// The bytes hold NUL or are not UTF-8.
+        binary: bool,
+        encoding: super::files::Encoding,
+        content: String,
+    },
+    /// `files`: the file now holds the written content.
+    FileWritten {
+        request: String,
+        path: String,
+        hash: String,
+        size: u64,
+        modified: i64,
+        created: bool,
+    },
+    /// `files`: the outcome of `file_trash` or `file_delete`, per path.
+    FileRemoved {
+        request: String,
+        removed: Vec<super::files::Removed>,
+        failed: Vec<super::files::Failure>,
+    },
+    /// `files`: a file request failed; nothing was changed.
+    FileError {
+        request: String,
+        error: super::files::Error,
+    },
 }
 
 impl Event {
@@ -610,7 +730,13 @@ impl Event {
             | Self::Search { request, .. }
             | Self::Diagnostics { request, .. }
             | Self::UploadStarted { request, .. }
-            | Self::UploadDone { request, .. } => Some(request),
+            | Self::UploadDone { request, .. }
+            | Self::FileList { request, .. }
+            | Self::FileStat { request, .. }
+            | Self::FileContent { request, .. }
+            | Self::FileWritten { request, .. }
+            | Self::FileRemoved { request, .. }
+            | Self::FileError { request, .. } => Some(request),
             Self::Error { request, .. } => request.as_deref(),
             _ => None,
         }
