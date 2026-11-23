@@ -158,3 +158,20 @@ Decisions:
 8. **Batches** (`file_trash`, `file_delete`) validate every path first, then report each path's outcome, so a client can show which entries remain.
 9. **Threading.** File operations run on worker threads, at most 4 per connection and 16 per server, of which 4 deletions (`busy` beyond), and their replies are delivered by the event loop like other correlated replies; pane output is never delayed by a slow disk. Replies are correlated, not ordered. File replies wait in a per-connection queue until the output queue has room, so large reads finishing together or a burst of `busy` refusals do not disconnect the client; an operation keeps its slot until its reply enters the output queue. The deletion bound caps the directory descriptors file operations hold (one per level of a tree), and the server raises its soft open-file limit to the hard limit (at most 65,536; shells get the original limit back) and survives `accept` running out of descriptors. There is no cancellation: an operation stuck on a hung mount keeps its slot, and enough of them make file requests answer `busy` until they return or the server restarts.
 10. **Compatibility.** Additive: a new capability, new request and event types and one optional Welcome field (`file_limits`). File events reach only the connection that sent the request. The stream version stays 1.
+
+## Bell merge (2026-11-23, ADR 0003 section 3)
+
+A bell and the agent notification it accompanies are one event, merged by the server so every client shows one notification (decision 205a). Before, the server recorded a bell (`unknown` status, `Bell · ` title) and the typed notification separately, and each client paired them itself: KelpMux web's `bellCompanion` and the TUI's `notification_state` looked for a typed notification of the same pane and process within 2 seconds. Contract: [native-client-protocol.md](native-client-protocol.md#notifications-host-status-and-server-lifecycle).
+
+| Capability | Session or client UI | Addition |
+| --- | --- | --- |
+| Merge a bell with the typed notification it accompanies | Session | `Notification.bell` (`bell-merge`): the typed notification of the same pane and process within 2 seconds, in either order, carries `bell: true` and no separate bell record remains. |
+| Sound, toast and favicon for a merged bell | Client UI | Derived from `bell` and the typed status. |
+
+Decisions:
+
+1. **Which record survives.** The typed one: it says what happened (question, finished, failed, exited), which is what clients showed for a paired bell anyway. A bell first is removed and the typed notification is recorded with a new ID, so clients alert for it as a new event; a typed notification first keeps its ID and read state and only gains `bell: true`, so nothing alerts twice.
+2. **No delay.** Bells are recorded at once and merged when the typed notification arrives; holding a bell back for 2 seconds to wait for a companion would delay every lone bell. The merge is decided when the second event arrives, so the server needs no timer.
+3. **Identity and window.** Same pane, same server run and same process ID (`origin`), at most 2 seconds apart, the window the clients used. Bells of another pane or process, or outside the window, stay separate records.
+4. **Read marks.** The merged record is one notification, so acknowledging it clears the event. An acknowledgement of a bell ID that was merged after the client saw it reaches the merged record (an in-memory map for the server's run, bounded to 64 entries).
+5. **Compatibility.** Additive: a new capability and one optional field, omitted when false. Older clients see fewer bell records, and their own pairing finds nothing to pair; they show the typed notification without its bell. The stream version stays 1.

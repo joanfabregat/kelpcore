@@ -14,6 +14,13 @@ use std::{
 };
 const MAX_EVENTS: usize = 256;
 const MAX_BYTES: u64 = 512 * 1024;
+/// A bell and a typed notification of the same pane and process at most
+/// this many seconds apart are one event (ADR 0003 section 3).
+pub const BELL_PAIR_WINDOW: u64 = 2;
+/// Superseded bell identifiers remembered so a late acknowledgement of one
+/// still reaches the record it was merged into.
+const MAX_ABSORBED: usize = 64;
+const BELL_PREFIX: &str = "Bell · ";
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct Seen {
     #[serde(default)]
@@ -57,6 +64,53 @@ pub struct Activity {
     path: PathBuf,
     workspace: String,
     data: Persisted,
+    /// Bell record ID → the typed record it was merged into. In memory
+    /// only: it covers acknowledgements already in flight when a bell is
+    /// merged, which a restart ends anyway.
+    absorbed: BTreeMap<u64, u64>,
+}
+fn is_bell_record(event: &Notification) -> bool {
+    event.status == Status::Unknown && event.title.starts_with(BELL_PREFIX)
+}
+/// Same pane and same process of this server run: the identity a bell and
+/// a typed notification must share to merge.
+fn same_origin(event: &Notification, pane: &Seen) -> bool {
+    !pane.run.is_empty()
+        && event.pane == pane.pane
+        && event
+            .origin
+            .as_ref()
+            .is_some_and(|origin| origin.run == pane.run && origin.pid == pane.pid)
+}
+/// Emit a typed notification, merging the bell records of the same pane
+/// and process from the pairing window into it. Each merged bell ID is
+/// added to `absorbed` with the ID of the record that replaces it.
+fn emit_typed(
+    data: &mut Persisted,
+    workspace: &str,
+    pane: &Seen,
+    status: Status,
+    time: u64,
+    absorbed: &mut Vec<(u64, u64)>,
+) -> Result<()> {
+    let mut merged = Vec::new();
+    data.events.retain(|event| {
+        let bell = is_bell_record(event)
+            && same_origin(event, pane)
+            && event.at.abs_diff(time) <= BELL_PAIR_WINDOW;
+        if bell {
+            merged.push(event.id);
+        }
+        !bell
+    });
+    let id = emit(data, workspace, pane, status, time, None)?;
+    if !merged.is_empty() {
+        if let Some(event) = data.events.last_mut() {
+            event.bell = true;
+        }
+        absorbed.extend(merged.into_iter().map(|bell| (bell, id)));
+    }
+    Ok(())
 }
 fn clean(text: &str) -> String {
     text.chars().filter(|c| !c.is_control()).take(128).collect()
@@ -91,7 +145,7 @@ fn emit(
     status: Status,
     time: u64,
     title: Option<String>,
-) -> Result<()> {
+) -> Result<u64> {
     let id = data.next_id.max(1);
     data.next_id = id
         .checked_add(1)
@@ -108,8 +162,9 @@ fn emit(
         at: time,
         read: false,
         workspace: workspace.into(),
+        bell: false,
     });
-    Ok(())
+    Ok(id)
 }
 impl Activity {
     pub fn load(state: &Path, workspace: &str) -> Result<Self> {
@@ -186,6 +241,7 @@ impl Activity {
             path,
             workspace: workspace.into(),
             data,
+            absorbed: BTreeMap::new(),
         })
     }
     /// Initial observations establish a baseline; reconnecting loads the existing baseline.
@@ -211,6 +267,7 @@ impl Activity {
         }
         let mut data = self.data.clone();
         let mut sounded = false;
+        let mut absorbed = Vec::new();
         if data.initialized {
             for old in self
                 .data
@@ -222,7 +279,14 @@ impl Activity {
                     .get(&old.pane)
                     .is_some_and(|new| same_identity(old, new))
                 {
-                    emit(&mut data, &self.workspace, old, Status::Exited, time, None)?;
+                    emit_typed(
+                        &mut data,
+                        &self.workspace,
+                        old,
+                        Status::Exited,
+                        time,
+                        &mut absorbed,
+                    )?;
                     sounded = true;
                 }
             }
@@ -252,7 +316,14 @@ impl Activity {
                     .get(&new.pane)
                     .is_some_and(|old| same_identity(old, new) && old.status == new.status);
                 if !repeated {
-                    emit(&mut data, &self.workspace, new, new.status, time, None)?;
+                    emit_typed(
+                        &mut data,
+                        &self.workspace,
+                        new,
+                        new.status,
+                        time,
+                        &mut absorbed,
+                    )?;
                     sounded = true;
                 }
             }
@@ -273,9 +344,24 @@ impl Activity {
             journal::atomic(&self.path, &data)?;
         }
         self.data = data;
+        self.remember_absorbed(absorbed);
         Ok(sounded)
     }
+    fn remember_absorbed(&mut self, absorbed: Vec<(u64, u64)>) {
+        if absorbed.is_empty() {
+            return;
+        }
+        self.absorbed.extend(absorbed);
+        let events = &self.data.events;
+        self.absorbed
+            .retain(|_, target| events.iter().any(|event| event.id == *target));
+        while self.absorbed.len() > MAX_ABSORBED {
+            self.absorbed.pop_first();
+        }
+    }
     /// Terminal bells are explicit events, distinct from inferred agent questions.
+    /// A bell within `BELL_PAIR_WINDOW` of a typed notification of the same
+    /// pane and process merges into it. Returns whether a bell record was added.
     pub fn bell(&mut self, pane: &PaneInfo, time: u64) -> Result<bool> {
         if pane.kind.is_none() {
             return Ok(false);
@@ -290,31 +376,46 @@ impl Activity {
         {
             return Ok(false);
         }
+        let mut seen = Seen::from(pane);
+        seen.run = self.run.clone();
+        // A typed notification of the same pane and process in the pairing
+        // window absorbs the bell: it is marked, and no bell record exists.
+        if let Some(index) = self.data.events.iter().rposition(|event| {
+            noteworthy(event.status)
+                && same_origin(event, &seen)
+                && event.at.abs_diff(time) <= BELL_PAIR_WINDOW
+        }) {
+            if !self.data.events[index].bell {
+                let mut data = self.data.clone();
+                data.events[index].bell = true;
+                journal::atomic(&self.path, &data)?;
+                self.data = data;
+            }
+            return Ok(false);
+        }
         if self.data.events.iter().rev().any(|event| {
-            event.pane == pane.id
-                && event.status == Status::Unknown
-                && event.title.starts_with("Bell · ")
-                && time.saturating_sub(event.at) < 2
+            event.pane == pane.id && is_bell_record(event) && time.saturating_sub(event.at) < 2
         }) {
             return Ok(false);
         }
         let mut data = self.data.clone();
-        let mut seen = Seen::from(pane);
-        seen.run = self.run.clone();
         emit(
             &mut data,
             &self.workspace,
             &seen,
             Status::Unknown,
             time,
-            Some(format!("Bell · {}", clean(&pane.title))),
+            Some(format!("{BELL_PREFIX}{}", clean(&pane.title))),
         )?;
         prune(&mut data, time);
         journal::atomic(&self.path, &data)?;
         self.data = data;
         Ok(true)
     }
+    /// Marks a notification read. A bell merged into a typed notification
+    /// after the client saw it acknowledges the record it was merged into.
     pub fn acknowledge(&mut self, id: u64) -> Result<()> {
+        let id = self.absorbed.get(&id).copied().unwrap_or(id);
         let mut data = self.data.clone();
         let event = data
             .events
