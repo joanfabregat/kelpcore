@@ -15,6 +15,8 @@ use std::{
 struct Daemon {
     root: PathBuf,
     thread: Option<thread::JoinHandle<kelpserver::Result<()>>>,
+    /// Dropped last, after the server stopped.
+    _watchdog: Watchdog,
 }
 impl Daemon {
     /// A server with two shell panes (1 and 2), created by a stream client.
@@ -40,6 +42,7 @@ impl Daemon {
         let daemon = Self {
             root,
             thread: Some(handle),
+            _watchdog: Watchdog::start(),
         };
         let deadline = Instant::now() + Duration::from_secs(5);
         while UnixStream::connect(daemon.root.join("control.sock")).is_err() {
@@ -97,6 +100,8 @@ impl Daemon {
     }
 }
 impl Drop for Daemon {
+    /// Ask the server to stop and wait for it, bounded: a lost request fails
+    /// the test with a reason instead of hanging it (kelpcore#4).
     fn drop(&mut self) {
         if let Ok(mut s) = UnixStream::connect(self.root.join("control.sock")) {
             for request in [
@@ -111,9 +116,51 @@ impl Drop for Daemon {
             }
         }
         if let Some(t) = self.thread.take() {
-            assert!(t.join().unwrap().is_ok());
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while !t.is_finished() {
+                if Instant::now() >= deadline {
+                    if !thread::panicking() {
+                        panic!("server did not stop within 30 s of the shutdown request");
+                    }
+                    return;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            let result = t.join();
+            if !thread::panicking() {
+                assert!(result.unwrap().is_ok());
+            }
         }
-        fs::remove_dir_all(&self.root).unwrap();
+        let _ = fs::remove_dir_all(&self.root);
+    }
+}
+/// Ends the whole test binary, naming the test, when a daemon outlives
+/// `LIMIT`: a wait without its own deadline fails in minutes instead of
+/// holding CI until the job timeout (kelpcore#4).
+struct Watchdog {
+    _alive: std::sync::mpsc::Sender<()>,
+}
+impl Watchdog {
+    const LIMIT: Duration = Duration::from_secs(120);
+    fn start() -> Self {
+        let test = thread::current().name().unwrap_or("a test").to_owned();
+        let (sender, receiver) = std::sync::mpsc::channel::<()>();
+        thread::spawn(move || {
+            // Disconnected: the daemon was dropped in time.
+            if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) =
+                receiver.recv_timeout(Self::LIMIT)
+            {
+                use std::io::Write;
+                // Straight to stderr: libtest captures `eprintln!`.
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "{test} still has its server after {:?}: a wait is stuck; exiting",
+                    Self::LIMIT
+                );
+                std::process::exit(101);
+            }
+        });
+        Self { _alive: sender }
     }
 }
 struct Peer {
