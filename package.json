@@ -1,0 +1,29 @@
+{
+  "name": "@kelpcore/web",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Kelp browser terminal layer: renderer, in-browser SSH, shared worker session, input encoding and the terminal component",
+  "license": "Apache-2.0",
+  "repository": "github:joanfabregat/kelpcore",
+  "type": "module",
+  "exports": {
+    "./*": "./web/src/*"
+  },
+  "files": [
+    "web/src",
+    "LICENSE",
+    "NOTICE"
+  ],
+  "scripts": {
+    "check": "tsc --noEmit",
+    "test": "node --test web/test/*.test.mjs"
+  },
+  "peerDependencies": {
+    "react": "^19.3.1"
+  },
+  "devDependencies": {
+    "@types/react": "19.3.0",
+    "react": "19.3.1",
+    "typescript": "7.0.2"
+  }
+}

@@ -41,6 +41,32 @@ jobs:
       - run: cargo +1.85.0 fetch --locked
       - run: cargo +1.85.0 build --locked --offline -p kelpserver --bin kelpserver
       - run: cargo +1.85.0 test --workspace --locked --offline -- --test-threads=2
+  wasm:
+    name: Client core for browsers (WASM)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install 1.99.0 --profile minimal --target wasm32-unknown-unknown
+      - run: cargo +1.99.0 fetch --locked
+      - run: cargo +1.99.0 build --locked --offline -p kelpclient --release --target wasm32-unknown-unknown
+      - run: ls -l target/wasm32-unknown-unknown/release/kelpclient.wasm
+  web:
+    name: Browser layer (locked npm, types, unit tests)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          persist-credentials: false
+      - name: Fetch and audit web dependencies
+        run: |
+          docker run --rm -v "$GITHUB_WORKSPACE:/w" -w /w docker.io/library/node:24-bookworm sh -euc "npm ci --ignore-scripts; npm audit --audit-level=high"
+      - name: Type-check and test without network
+        run: |
+          docker run --rm --network=none -v "$GITHUB_WORKSPACE:/w" -w /w docker.io/library/node:24-bookworm sh -euc "npm run check; npm test"
   dependencies:
     runs-on: ubuntu-24.04
     timeout-minutes: 15

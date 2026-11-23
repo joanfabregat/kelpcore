@@ -9,3 +9,6 @@
 *.pem
 *.log
 /metadata.json
+
+# Node dependencies of the web layer.
+/node_modules/
