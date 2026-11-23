@@ -366,6 +366,13 @@ export class Session {
           this.capabilities = new Set(event.Stream.capabilities);
           if (this.capabilities.has("clipboard-write"))
             this.request("clipboard", { enabled: true });
+          // Screens as binary records (KelpServer `binary-screens`): the
+          // WASM core decodes them and returns ordinary JSON updates. A
+          // relay between this page and the server must forward binary
+          // records unchanged (KelpMux's web bridge does since it adopted
+          // this); never send the request to a server without it.
+          if (this.capabilities.has("binary-screens"))
+            this.request("binary_screens", { enabled: true });
         }
         if (event.Stream?.type === "lease") {
           if (

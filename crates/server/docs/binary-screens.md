@@ -29,7 +29,7 @@ The `update` and its binary record are written as one packet. The server keeps o
 
 ## Bridges
 
-`kelpserver bridge` relays binary records from the server to the client unchanged, without parsing them, once the server's Welcome has been relayed; client-to-server records must still be JSON stream requests. Any other bridge or relay must do the same: forward a record whose payload starts with `0x00` as opaque bytes. KelpMux's web bridge currently decodes every server record as JSON and re-serializes it, so it must forward binary records verbatim before its browser client opts in.
+`kelpserver bridge` relays binary records from the server to the client unchanged, without parsing them, once the server's Welcome has been relayed; client-to-server records must still be JSON stream requests. Any other bridge or relay must do the same: forward a record whose payload starts with `0x00` as opaque bytes. The browser `Session` opts in whenever Welcome lists the capability, so a bridge between a browser and the server must forward binary records: KelpMux's `kelpmux web-bridge` does from the KelpMux change that adopted binary screens, while earlier ones decode every server record as JSON and re-serialize it, which fails on a binary record. Applications deploy their web assets and their bridge from the same build.
 
 ## Format, version 1
 
@@ -85,4 +85,4 @@ Decoded snapshots are complete `PaneSnapshot` values. A decoded patch is a `RowP
 
 - **Rust clients** (the KelpMux TUI) read records with `kelpserver::native::protocol::read_server_record`, which returns either a JSON `ServerMessage` or the raw bytes of a binary record, then decode with `kelpclient_protocol::screens::decode`.
 - **Bridges** forward binary records without parsing them (see [Bridges](#bridges)).
-- **Browsers** decode in the client's WASM core with the same crate; the decoded screens can then be laid out as typed arrays and transferred to windows.
+- **Browsers:** the `@kelpcore/web` `Session` (`web/src/connection.ts`) sends the opt-in when Welcome lists `binary-screens`, and the WASM core decodes the records in `kelpclient::Client::receive` with the same crate. The core returns each update with its screens as JSON `snapshots` and `patches` (a binary patch as a cell patch of its whole rows), so the shared worker, the windows and the renderer are unchanged. Laying the screens out as typed arrays transferred to windows (ADR 0003 section 2) is not implemented: on 2026-11-22, switching a browser from a grid tile to a 298-column terminal through a real server and bridge took 186 ms instead of 323 ms (Chromium; WebKit 141 ms instead of 254 ms) with 20 KiB instead of 1.5 MiB on the wire, and the page spent about 25 ms receiving it either way. The remaining per-window cost is the JSON and structured-clone hand-off of per-cell objects between the WASM core, the shared worker and each window, which typed arrays would address.

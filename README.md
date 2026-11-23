@@ -74,6 +74,8 @@ The browser layer loads these at runtime from the page's origin; the application
 | `/vendor/ssh.wasm` | The OpenSSH WASM client from the Secure Shell release (OpenSSH with OpenSSL, zlib and ldns, each under its own license) |
 | `/ssh` | A WebSocket relay to the SSH endpoint |
 
+The browser `Session` opts in to [binary screens](crates/server/docs/binary-screens.md) whenever Welcome lists `binary-screens`, and the WASM core decodes them. Everything between the page and the server must therefore forward binary records unchanged: `kelpserver bridge` does, and so must an application's own bridge (KelpMux's `kelpmux web-bridge` does since it adopted this revision). Deploy the web assets and the bridge from the same build; a bridge that re-serializes every record as JSON breaks the stream once the browser opts in.
+
 In-browser SSH also needs a cross-origin isolated page (`SharedArrayBuffer`). KelpMux's `scripts/fetch-web-ssh.sh` fetches and verifies the vendored SSH assets; their license texts must be served with the application. They are not part of this repository.
 
 ## Build and test
