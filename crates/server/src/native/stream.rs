@@ -16,7 +16,10 @@
 //! At most 100,000 cells are subscribed per connection. A later resize exceeding
 //! that aggregate budget disconnects that subscriber rather than accumulating state.
 //! Server retains one in-flight packet and one replaceable aggregate update; excess
-//! reliable responses disconnect a slow peer. Notifications are the latest 128
+//! reliable responses disconnect a slow peer. File replies (`files`) are the
+//! exception: they wait in a per-connection queue, bounded by the
+//! connection's operation slots and at most 256 immediate refusals, and enter
+//! the output queue as it drains. Notifications are the latest 128
 //! retained records, not an exactly-once event log; acknowledgement is explicit.
 //!
 //! The session API (capabilities `pane-lifecycle`, `closed-sessions`,

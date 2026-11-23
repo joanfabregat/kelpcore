@@ -41,26 +41,75 @@ pub struct ServerConfig {
     /// File operations (`files`): the trash location.
     pub files: super::files::Settings,
 }
-/// File operations running on worker threads, counted per connection until
-/// their reply is delivered (or dropped after a disconnect).
+/// A finished file operation: the connection, whether it was a deletion, and
+/// its reply.
+type FileResult = (u64, bool, super::stream::Event);
+/// File operations, counted per connection from their start until their
+/// reply enters the connection's output queue (or is dropped after a
+/// disconnect). A reply held for a connection that has not read earlier
+/// output keeps its slot, so held replies are bounded like running ones.
 struct FileJobs {
     running: BTreeMap<u64, usize>,
-    sender: std::sync::mpsc::Sender<(u64, super::stream::Event)>,
-    receiver: std::sync::mpsc::Receiver<(u64, super::stream::Event)>,
+    /// `file_delete` operations still running on a worker thread.
+    deletes: usize,
+    sender: std::sync::mpsc::Sender<FileResult>,
+    receiver: std::sync::mpsc::Receiver<FileResult>,
 }
 impl FileJobs {
     fn new() -> Self {
         let (sender, receiver) = std::sync::mpsc::channel();
         Self {
             running: BTreeMap::new(),
+            deletes: 0,
             sender,
             receiver,
+        }
+    }
+    fn release(&mut self, id: u64, count: usize) {
+        if count == 0 {
+            return;
+        }
+        if let Some(running) = self.running.get_mut(&id) {
+            *running = running.saturating_sub(count);
+            if *running == 0 {
+                self.running.remove(&id);
+            }
         }
     }
 }
 const MAX_CLIENTS: usize = 16;
 const MAX_QUEUED: usize = MAX_MESSAGE + 4;
 const MAX_PTY_WRITE: usize = 256 * 1024;
+/// Output-queue room a file reply leaves for other reliable messages: a
+/// reply enters the queue only while the queue stays this far below
+/// `MAX_QUEUED` and below half its message count. The largest file reply
+/// (15 MiB, `files::REPLY_BUDGET`) still fits an otherwise empty queue.
+const FILE_REPLY_HEADROOM: usize = 512 * 1024;
+const MAX_OUTPUT_MESSAGES: usize = 32;
+/// File replies held per connection, beyond which it is a slow peer: its own
+/// running operations (at most `files::MAX_IN_FLIGHT`) plus immediate
+/// refusals such as `busy`.
+const MAX_HELD_FILE_REPLIES: usize = 256;
+/// Pause after `accept` fails for lack of descriptors or memory.
+const ACCEPT_BACKOFF: Duration = Duration::from_millis(250);
+/// The open-file limit the server started with: the server raises its soft
+/// limit and restores this one for its shells.
+static OPEN_FILES: std::sync::OnceLock<libc::rlimit> = std::sync::OnceLock::new();
+/// Raise the soft open-file limit to the hard limit (at most 65,536): the
+/// server holds descriptors for PTYs, connections and file operations, and
+/// polls them with `poll`, which has no `select` ceiling.
+fn raise_open_file_limit() {
+    let mut limit: libc::rlimit = unsafe { std::mem::zeroed() };
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+        return;
+    }
+    OPEN_FILES.get_or_init(|| limit);
+    let target = limit.rlim_max.min(65_536);
+    if limit.rlim_cur < target {
+        limit.rlim_cur = target;
+        unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) };
+    }
+}
 
 fn private_directory(path: &Path) -> Result<()> {
     if path == Path::new("/") || path == Path::new("/tmp") {
@@ -253,11 +302,17 @@ impl NativePane {
             .stdin(Stdio::from(slave.try_clone()?))
             .stdout(Stdio::from(slave.try_clone()?))
             .stderr(Stdio::from(slave));
+        let open_files = OPEN_FILES.get().copied();
         // Only async-signal-safe libc operations occur between fork and exec.
         unsafe {
-            command.pre_exec(|| {
+            command.pre_exec(move || {
                 if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY, 0) < 0 {
                     return Err(std::io::Error::last_os_error());
+                }
+                // Shells get the limit the server started with, not the
+                // raised one (programs using `select` expect a low limit).
+                if let Some(limit) = &open_files {
+                    libc::setrlimit(libc::RLIMIT_NOFILE, limit);
                 }
                 // Mark all nonstandard descriptors close-on-exec, including future inherited fds.
                 if libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, 4u32) < 0 {
@@ -458,6 +513,9 @@ struct Client {
     rejected: Option<String>,
     /// Close once the queued output (the rejection) has been written.
     closing: bool,
+    /// Framed file replies waiting for room in the output queue, each marked
+    /// when it holds an operation slot (`FileJobs::running`).
+    file_replies: VecDeque<(Vec<u8>, bool)>,
 }
 struct StreamClient {
     clipboard: bool,
@@ -527,16 +585,57 @@ impl Client {
             failed: false,
             rejected: None,
             closing: false,
+            file_replies: VecDeque::new(),
         })
     }
     fn send(&mut self, message: ServerMessage) -> Result<()> {
         let bytes = wire(&message)?;
-        if self.queued + bytes.len() > MAX_QUEUED || self.output.len() >= 32 {
+        if self.queued + bytes.len() > MAX_QUEUED || self.output.len() >= MAX_OUTPUT_MESSAGES {
             return Err("slow native client".into());
         }
         self.queued += bytes.len();
         self.output.push_back(bytes);
         Ok(())
+    }
+    /// Hold a file reply until the output queue has room for it (see
+    /// `pump_files`). File replies can be large (a read is up to about
+    /// 11 MiB) and several can finish at once, so they wait here instead of
+    /// overflowing the queue, which would disconnect the client. `false`
+    /// when too many replies are held.
+    fn hold_file_reply(&mut self, event: super::stream::Event, counted: bool) -> bool {
+        let Ok(bytes) = wire(&ServerMessage::Stream(event)) else {
+            return false;
+        };
+        if !counted && self.file_replies.len() >= MAX_HELD_FILE_REPLIES {
+            return false;
+        }
+        self.file_replies.push_back((bytes, counted));
+        true
+    }
+    /// Move held file replies into the output queue, in order, while it
+    /// keeps room for other reliable messages; returns how many operation
+    /// slots that released.
+    fn pump_files(&mut self) -> usize {
+        let mut released = 0;
+        while let Some((bytes, _)) = self.file_replies.front() {
+            if self.output.len() >= MAX_OUTPUT_MESSAGES / 2
+                || self.queued + bytes.len() + FILE_REPLY_HEADROOM > MAX_QUEUED
+            {
+                break;
+            }
+            let (bytes, counted) = self.file_replies.pop_front().unwrap();
+            released += usize::from(counted);
+            self.queued += bytes.len();
+            self.output.push_back(bytes);
+        }
+        released
+    }
+    /// Operation slots held by replies not yet in the output queue.
+    fn held_slots(&self) -> usize {
+        self.file_replies
+            .iter()
+            .filter(|(_, counted)| *counted)
+            .count()
     }
     fn idle(&self) -> bool {
         self.update.is_none() && self.writing.is_none() && self.output.is_empty()
@@ -1349,55 +1448,70 @@ impl Server {
     fn start_file(&mut self, id: u64, request: super::stream::Request) -> Result<()> {
         use super::files::{self, Code, Error};
         let correlation = request.correlation().unwrap_or_default().to_owned();
+        let delete = matches!(request, super::stream::Request::FileDelete { .. });
         let running = self.files.running.get(&id).copied().unwrap_or(0);
         let total: usize = self.files.running.values().sum();
-        if running >= files::MAX_IN_FLIGHT || total >= files::MAX_SERVER_IN_FLIGHT {
-            return self.reply(
-                id,
-                files::failure(
-                    correlation,
-                    Error::new(
-                        Code::Busy,
-                        format!(
-                            "at most {} file operations per connection and {} per server run at once",
-                            files::MAX_IN_FLIGHT,
-                            files::MAX_SERVER_IN_FLIGHT
-                        ),
-                    ),
-                ),
-            );
+        let refusal = if running >= files::MAX_IN_FLIGHT || total >= files::MAX_SERVER_IN_FLIGHT {
+            Some(format!(
+                "at most {} file operations per connection and {} per server run at once",
+                files::MAX_IN_FLIGHT,
+                files::MAX_SERVER_IN_FLIGHT
+            ))
+        } else if delete && self.files.deletes >= files::MAX_SERVER_DELETES {
+            Some(format!(
+                "at most {} deletions per server run at once",
+                files::MAX_SERVER_DELETES
+            ))
+        } else {
+            let sender = self.files.sender.clone();
+            let settings = self.config.files.clone();
+            std::thread::Builder::new()
+                .name("kelpserver-files".into())
+                .spawn(move || {
+                    let _ = sender.send((id, delete, files::execute(request, &settings)));
+                })
+                .err()
+                .map(|error| error.to_string())
+        };
+        let Some(message) = refusal else {
+            *self.files.running.entry(id).or_default() += 1;
+            self.files.deletes += usize::from(delete);
+            return Ok(());
+        };
+        // The refusal waits with the other file replies, so a burst of
+        // requests answered `busy` at once cannot overflow the output queue.
+        let client = self.clients.get_mut(&id).ok_or("unknown client")?;
+        if !client.hold_file_reply(
+            files::failure(correlation, Error::new(Code::Busy, message)),
+            false,
+        ) {
+            return Err("slow native client".into());
         }
-        let sender = self.files.sender.clone();
-        let settings = self.config.files.clone();
-        let spawned = std::thread::Builder::new()
-            .name("kelpserver-files".into())
-            .spawn(move || {
-                let _ = sender.send((id, files::execute(request, &settings)));
-            });
-        if let Err(error) = spawned {
-            return self.reply(
-                id,
-                files::failure(correlation, Error::new(Code::Busy, error.to_string())),
-            );
-        }
-        *self.files.running.entry(id).or_default() += 1;
+        let released = client.pump_files();
+        self.files.release(id, released);
         Ok(())
     }
-    /// Deliver finished file operations to their connections.
+    /// Hold finished file operations for their connections, and move held
+    /// replies into output queues with room.
     fn poll_files(&mut self) {
-        while let Ok((id, event)) = self.files.receiver.try_recv() {
-            if let Some(running) = self.files.running.get_mut(&id) {
-                *running -= 1;
-                if *running == 0 {
-                    self.files.running.remove(&id);
+        while let Ok((id, delete, event)) = self.files.receiver.try_recv() {
+            self.files.deletes -= usize::from(delete);
+            match self.clients.get_mut(&id) {
+                // Bounded by the connection's own slots; only a reply that
+                // cannot be framed is refused (`execute` keeps them small).
+                Some(client) => {
+                    if !client.hold_file_reply(event, true) {
+                        client.failed = true;
+                        self.files.release(id, 1);
+                    }
                 }
+                None => self.files.release(id, 1),
             }
-            if let Some(client) = self.clients.get_mut(&id) {
-                // A connection that cannot take a reliable reply is a slow
-                // peer; the next flush disconnects it.
-                if client.send(ServerMessage::Stream(event)).is_err() {
-                    client.failed = true;
-                }
+        }
+        for (id, client) in &mut self.clients {
+            if !client.file_replies.is_empty() {
+                let released = client.pump_files();
+                self.files.release(*id, released);
             }
         }
     }
@@ -2268,7 +2382,11 @@ impl Server {
         self.dirty = false;
     }
     fn remove_client(&mut self, id: u64) {
-        self.clients.remove(&id);
+        if let Some(client) = self.clients.remove(&id) {
+            // Replies held for it are dropped with their slots; operations
+            // still running release theirs when they finish.
+            self.files.release(id, client.held_slots());
+        }
         self.uploads.disconnect(id);
         self.recovery_waiters.retain(|(client, _)| *client != id);
         let before = self.leases.len();
@@ -2356,6 +2474,7 @@ fn discovery_worker(
 /// pane's exit. It starts without panes; clients create them with `spawn`.
 pub fn serve(config: ServerConfig) -> Result<()> {
     super::stream::validate_size(config.cols, config.rows)?;
+    raise_open_file_limit();
     let (listener, _endpoint) = endpoint(&config)?;
     super::lifecycle::save_pid(&config.state_dir)?;
     let mut uploads = super::uploads::Uploads::new(&config.state_dir, &config.uploads)?;
@@ -2408,10 +2527,22 @@ pub fn serve(config: ServerConfig) -> Result<()> {
     let mut metrics_time = Instant::now();
     let mut idle_poll = Instant::now() - Duration::from_millis(100);
     let mut unused_poll = Instant::now() - Duration::from_secs(1);
+    // While `accept` lacks descriptors or memory, the listener is left alone
+    // until this instant (polling it would wake the loop at once).
+    let mut accept_paused: Option<Instant> = None;
+    // Logged once per episode of failures, not on every retry.
+    let mut accept_failing = false;
     while !server.shutdown {
+        if accept_paused.is_some_and(|until| Instant::now() >= until) {
+            accept_paused = None;
+        }
         for _ in 0..MAX_CLIENTS {
+            if accept_paused.is_some() {
+                break;
+            }
             match listener.accept() {
                 Ok((socket, _)) if server.clients.len() < MAX_CLIENTS => {
+                    accept_failing = false;
                     if let Ok(client) = Client::new(socket) {
                         let id = server.next_client;
                         server.next_client += 1;
@@ -2420,6 +2551,25 @@ pub fn serve(config: ServerConfig) -> Result<()> {
                 }
                 Ok(_) => (),
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                // The pending connection failed or a signal interrupted.
+                Err(e)
+                    if matches!(
+                        e.raw_os_error(),
+                        Some(libc::EINTR | libc::ECONNABORTED | libc::EPROTO)
+                    ) => {}
+                // Transient exhaustion must not stop the server: retry soon.
+                Err(e)
+                    if matches!(
+                        e.raw_os_error(),
+                        Some(libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM)
+                    ) =>
+                {
+                    if !accept_failing {
+                        eprintln!("kelpserver: accepting a connection: {e}; retrying shortly");
+                        accept_failing = true;
+                    }
+                    accept_paused = Some(Instant::now() + ACCEPT_BACKOFF);
+                }
                 Err(e) => return Err(e.into()),
             }
         }
@@ -2521,7 +2671,11 @@ pub fn serve(config: ServerConfig) -> Result<()> {
         // poll yields without blocking a disconnected observer or PTY output pump.
         let mut fds = vec![libc::pollfd {
             fd: listener.as_raw_fd(),
-            events: libc::POLLIN,
+            events: if accept_paused.is_some() {
+                0
+            } else {
+                libc::POLLIN
+            },
             revents: 0,
         }];
         for pane in server.panes.values() {

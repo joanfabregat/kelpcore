@@ -445,6 +445,91 @@ fn a_stale_base_hash_is_a_conflict_carrying_the_current_hash() {
     peer.write(&file, "mine", Some(&ABC.to_uppercase()), false)
         .unwrap();
     assert_eq!(fs::read_to_string(&file).unwrap(), "mine");
+    // A file now larger than any read is a conflict, without hashing it.
+    let large = vec![b'a'; files::MAX_READ_BYTES as usize + 1];
+    fs::write(&file, &large).unwrap();
+    let error = peer.write(&file, "mine", Some(ABC), false).unwrap_err();
+    assert_eq!(error.code, Code::Conflict);
+    assert_eq!(error.current_hash, None);
+    assert_eq!(error.size, Some(large.len() as u64));
+    assert_eq!(fs::metadata(&file).unwrap().len(), large.len() as u64);
+}
+
+#[test]
+fn writes_refuse_a_read_only_file_and_keep_the_group() {
+    let daemon = Daemon::start();
+    let mut peer = daemon.peer();
+    let work = daemon.work();
+    let file = work.join("locked.txt");
+    fs::write(&file, "keep").unwrap();
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o444)).unwrap();
+    // Like a shell's `>`, which root may still use.
+    if unsafe { libc::geteuid() } != 0 {
+        let error = peer.write(&file, "lost", None, false).unwrap_err();
+        assert_eq!(error.code, Code::PermissionDenied);
+        assert_eq!(fs::read_to_string(&file).unwrap(), "keep");
+        assert_eq!(mode(&file), 0o444);
+    }
+    // The group of a replaced file is kept when the user may set it: root
+    // any group, others a supplementary group of theirs.
+    let grouped = work.join("grouped.txt");
+    fs::write(&grouped, "old").unwrap();
+    let egid = unsafe { libc::getegid() };
+    let target = if unsafe { libc::geteuid() } == 0 {
+        Some(4242)
+    } else {
+        let mut groups = vec![0 as libc::gid_t; 256];
+        let count = unsafe { libc::getgroups(groups.len() as libc::c_int, groups.as_mut_ptr()) };
+        groups.truncate(count.max(0) as usize);
+        groups.into_iter().find(|gid| *gid != egid)
+    };
+    let changed = target
+        .filter(|gid| std::os::unix::fs::chown(&grouped, None, Some(*gid)).is_ok())
+        .is_some();
+    peer.write(&grouped, "new", None, false).unwrap();
+    assert_eq!(fs::read_to_string(&grouped).unwrap(), "new");
+    let expected = if changed { target.unwrap() } else { egid };
+    assert_eq!(fs::metadata(&grouped).unwrap().gid(), expected);
+}
+
+#[test]
+fn reading_a_fifo_never_opens_it() {
+    use std::{
+        os::unix::{ffi::OsStrExt, fs::OpenOptionsExt},
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+    };
+    let daemon = Daemon::start();
+    let mut peer = daemon.peer();
+    let fifo = daemon.work().join("fifo");
+    let name = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+    // A writer opening a FIFO blocks until a reader opens it: a read that
+    // opened the FIFO before refusing it would release the writer.
+    let released = Arc::new(AtomicBool::new(false));
+    let writer = {
+        let (fifo, released) = (fifo.clone(), released.clone());
+        thread::spawn(move || {
+            let file = fs::OpenOptions::new().write(true).open(&fifo).unwrap();
+            released.store(true, Ordering::SeqCst);
+            drop(file);
+        })
+    };
+    thread::sleep(Duration::from_millis(100));
+    assert_eq!(peer.read(&fifo, None).unwrap_err().code, Code::NotAFile);
+    thread::sleep(Duration::from_millis(200));
+    assert!(!released.load(Ordering::SeqCst));
+    // Release the writer.
+    let reader = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(&fifo)
+        .unwrap();
+    writer.join().unwrap();
+    drop(reader);
+    assert!(released.load(Ordering::SeqCst));
 }
 
 #[test]
@@ -781,8 +866,14 @@ fn size_entry_and_path_limits_are_enforced() {
     let (entries, truncated) = peer.list(&many);
     assert!(truncated);
     assert_eq!(entries.len(), files::MAX_LIST_ENTRIES);
-    // Directories sort first, so a truncated listing keeps them.
+    // Directories sort first, so a truncated listing keeps them; then the
+    // first names in order, whatever order the directory returned them in.
     assert_eq!(entries[0].name, "zz-dir");
+    assert_eq!(entries[1].name, "00000");
+    assert_eq!(
+        entries[files::MAX_LIST_ENTRIES - 1].name,
+        format!("{:05}", files::MAX_LIST_ENTRIES - 2)
+    );
 
     let paths: Vec<String> = (0..=files::MAX_PATHS)
         .map(|n| text(&work.join(n.to_string())))
@@ -917,4 +1008,81 @@ fn concurrent_operations_all_complete() {
     }
     assert!(contents >= files::MAX_IN_FLIGHT);
     assert_eq!(peer.read(&work.join("x"), None).unwrap().0, ABC);
+}
+
+#[test]
+fn concurrent_largest_reads_all_arrive() {
+    let daemon = Daemon::start();
+    let mut peer = daemon.peer();
+    let work = daemon.work();
+    // Binary content travels as base64: each reply is about 11.2 MiB, so
+    // several together exceed one connection's output queue and must wait
+    // for it to drain instead of disconnecting the client.
+    let bytes: Vec<u8> = (0..=255u8)
+        .cycle()
+        .take(files::MAX_READ_BYTES as usize)
+        .collect();
+    fs::write(work.join("blob"), &bytes).unwrap();
+    let ids: Vec<String> = (0..files::MAX_IN_FLIGHT).map(|_| peer.id()).collect();
+    for id in &ids {
+        peer.send(Request::FileRead {
+            request: id.clone(),
+            path: text(&work.join("blob")),
+            max_bytes: None,
+        });
+    }
+    let mut pending: std::collections::BTreeSet<String> = ids.into_iter().collect();
+    while !pending.is_empty() {
+        match peer.next() {
+            Event::FileContent {
+                request,
+                encoding,
+                content,
+                ..
+            } => {
+                assert_eq!(encoding, Encoding::Base64);
+                assert_eq!(STANDARD.decode(content).unwrap(), bytes);
+                assert!(pending.remove(&request));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+    fs::write(work.join("x"), "abc").unwrap();
+    assert_eq!(peer.read(&work.join("x"), None).unwrap().0, ABC);
+}
+
+#[test]
+fn a_burst_of_refused_requests_keeps_the_connection() {
+    let daemon = Daemon::start();
+    let mut peer = daemon.peer();
+    let work = daemon.work();
+    // Far more requests than run at once: the refusals (`busy`) must not
+    // overflow the output queue, which would disconnect the client.
+    // One write, so the server reads them all in one pass.
+    let ids: Vec<String> = (0..64).map(|_| peer.id()).collect();
+    let mut burst = Vec::new();
+    for id in &ids {
+        let request = Request::FileStat {
+            request: id.clone(),
+            path: text(&work),
+        };
+        write_message(&mut burst, &ClientMessage::Stream(request)).unwrap();
+    }
+    std::io::Write::write_all(&mut peer.socket, &burst).unwrap();
+    let mut pending: std::collections::BTreeSet<String> = ids.into_iter().collect();
+    let mut busy = 0;
+    while !pending.is_empty() {
+        match peer.next() {
+            Event::FileStat { request, .. } => assert!(pending.remove(&request)),
+            Event::FileError { request, error } => {
+                assert_eq!(error.code, Code::Busy);
+                assert!(pending.remove(&request));
+                busy += 1;
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+    assert!(busy > 0);
+    let (_, entry) = peer.stat(&text(&work)).unwrap();
+    assert_eq!(entry.kind, Kind::Dir);
 }

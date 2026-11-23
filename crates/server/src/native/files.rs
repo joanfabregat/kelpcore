@@ -17,16 +17,24 @@
 //!   directory with `O_NOFOLLOW`. Reads, stats and listings follow symlinks
 //!   in intermediate components like a shell does; `file_stat` and listing
 //!   entries describe a symlink itself (`lstat`) and report its target.
+//! - Nothing that is not a regular file is opened for reading or writing:
+//!   the type is checked first, since opening a device or FIFO can have side
+//!   effects.
 //! - Writes are atomic replacements: a temporary file in the same directory,
 //!   synced, then renamed over the target, keeping the target's permission
-//!   bits. A `base_hash` turns the write into a compare-and-swap on the
-//!   content's SHA-256.
+//!   bits and group. A read-only target is refused, like a shell's `>`. A
+//!   `base_hash` turns the write into a compare-and-swap on the content's
+//!   SHA-256, re-checked against the file's metadata just before the rename.
+//! - `/` and the server user's home directory are never removed, and
+//!   recursive deletion never crosses into another file system.
 //! - Sizes, entry counts, paths per request and concurrent operations are
 //!   bounded ([`LIMITS`], advertised in Welcome `file_limits`).
 //!
 //! Operations run on worker threads, at most [`MAX_IN_FLIGHT`] per
-//! connection and [`MAX_SERVER_IN_FLIGHT`] per server, so a slow disk never
-//! stalls pane output.
+//! connection and [`MAX_SERVER_IN_FLIGHT`] per server (of which at most
+//! [`MAX_SERVER_DELETES`] deletions), so a slow disk never stalls pane
+//! output. There is no cancellation: an operation stuck on a hung mount keeps
+//! its slot until it returns.
 //!
 //! The descriptor-relative design, the text/binary classification and the
 //! atomic replacement are adapted from KelpHub's workspace file browser
@@ -51,9 +59,10 @@ use std::{
 pub const MAX_READ_BYTES: u64 = 8 * 1024 * 1024;
 /// Largest content `file_write` accepts, after decoding.
 pub const MAX_WRITE_BYTES: u64 = 8 * 1024 * 1024;
-/// Most entries one `file_list` returns (sorted, then truncated).
+/// Most entries one `file_list` returns: the first ones in listing order.
 pub const MAX_LIST_ENTRIES: usize = 5000;
-/// Most directory entries one listing examines.
+/// Most directory entries one listing scans. Only the kept entries are held
+/// and examined, so this bounds the time of a listing, not its memory.
 const MAX_LIST_SCAN: usize = 200_000;
 /// Most paths in one `file_trash` or `file_delete`.
 pub const MAX_PATHS: usize = 256;
@@ -61,6 +70,10 @@ pub const MAX_PATHS: usize = 256;
 pub const MAX_IN_FLIGHT: usize = 4;
 /// Concurrent file operations per server.
 pub const MAX_SERVER_IN_FLIGHT: usize = 16;
+/// Concurrent `file_delete` operations per server. A recursive deletion
+/// holds one directory descriptor per level (up to [`MAX_DEPTH`]), so this
+/// bounds the descriptors all file operations can hold to a few hundred.
+pub const MAX_SERVER_DELETES: usize = 4;
 /// Longest accepted path, in bytes.
 pub const MAX_PATH_BYTES: usize = 4096;
 /// Deepest directory nesting `file_delete` removes.
@@ -326,6 +339,39 @@ fn is_dir(st: &libc::stat) -> bool {
 fn is_regular(st: &libc::stat) -> bool {
     st.st_mode & libc::S_IFMT == libc::S_IFREG
 }
+fn is_symlink(st: &libc::stat) -> bool {
+    st.st_mode & libc::S_IFMT == libc::S_IFLNK
+}
+/// Refuse what is not a regular file, before it is opened.
+fn regular(st: &libc::stat, path: &Path, verb: &str) -> Outcome<()> {
+    if is_dir(st) {
+        return Err(Error::new(Code::IsADirectory, format!("cannot {verb} a directory")).at(path));
+    }
+    if !is_regular(st) {
+        return Err(Error::new(Code::NotAFile, "not a regular file").at(path));
+    }
+    Ok(())
+}
+/// The same inode, unchanged in size, content time and status time.
+fn same_version(a: &libc::stat, b: &libc::stat) -> bool {
+    (
+        a.st_dev,
+        a.st_ino,
+        a.st_size,
+        a.st_mtime,
+        a.st_mtime_nsec,
+        a.st_ctime,
+        a.st_ctime_nsec,
+    ) == (
+        b.st_dev,
+        b.st_ino,
+        b.st_size,
+        b.st_mtime,
+        b.st_mtime_nsec,
+        b.st_ctime,
+        b.st_ctime_nsec,
+    )
+}
 fn read_link_at(dir: RawFd, name: &CStr) -> Option<String> {
     let mut buffer = vec![0u8; MAX_TARGET_BYTES];
     let length =
@@ -384,6 +430,71 @@ fn names(dir: RawFd, limit: usize) -> io::Result<(Vec<CString>, bool)> {
     }
     unsafe { libc::closedir(stream) };
     Ok((names, more))
+}
+/// The first [`MAX_LIST_ENTRIES`] names of a directory in listing order
+/// (directories first, then by name bytes), selected while scanning at most
+/// [`MAX_LIST_SCAN`] entries: only the kept names are held, and the type
+/// comes from `d_type` (a `stat` only where the file system leaves it
+/// unknown). Returns the kept names, whether entries were left out, and how
+/// many names were not UTF-8.
+fn select(dir: RawFd) -> io::Result<(Vec<CString>, bool, usize)> {
+    let copy = check(unsafe { libc::fcntl(dir, libc::F_DUPFD_CLOEXEC, 0) })?;
+    let stream = unsafe { libc::fdopendir(copy) };
+    if stream.is_null() {
+        let error = io::Error::last_os_error();
+        unsafe { libc::close(copy) };
+        return Err(error);
+    }
+    unsafe { libc::rewinddir(stream) };
+    // A max-heap of `(not a directory, name)`: its top is the entry that
+    // sorts last, the first to drop when a smaller one arrives.
+    let mut kept: std::collections::BinaryHeap<(bool, CString)> =
+        std::collections::BinaryHeap::with_capacity(MAX_LIST_ENTRIES + 1);
+    let mut truncated = false;
+    let mut skipped = 0;
+    let mut scanned = 0;
+    loop {
+        let entry = unsafe { libc::readdir(stream) };
+        if entry.is_null() {
+            break;
+        }
+        let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
+        if name.to_bytes() == b"." || name.to_bytes() == b".." {
+            continue;
+        }
+        if scanned == MAX_LIST_SCAN {
+            truncated = true;
+            break;
+        }
+        scanned += 1;
+        // A name that is not UTF-8 cannot be addressed by a JSON path.
+        if std::str::from_utf8(name.to_bytes()).is_err() {
+            skipped += 1;
+            continue;
+        }
+        let directory = match unsafe { (*entry).d_type } {
+            libc::DT_DIR => true,
+            libc::DT_UNKNOWN => stat_at(dir, name).is_ok_and(|st| is_dir(&st)),
+            _ => false,
+        };
+        if kept.len() == MAX_LIST_ENTRIES {
+            truncated = true;
+            let later = kept.peek().is_some_and(|(top_file, top)| {
+                (!directory, name.to_bytes_with_nul()) >= (*top_file, top.to_bytes_with_nul())
+            });
+            if later {
+                continue;
+            }
+            kept.pop();
+        }
+        kept.push((!directory, name.to_owned()));
+    }
+    unsafe { libc::closedir(stream) };
+    Ok((
+        kept.into_iter().map(|(_, name)| name).collect(),
+        truncated,
+        skipped,
+    ))
 }
 fn random_hex() -> io::Result<String> {
     let mut bytes = [0u8; 8];
@@ -466,32 +577,36 @@ fn escaped_len(text: &str) -> usize {
         })
         .sum()
 }
-/// Stream a file through SHA-256.
-fn hash_file(file: &mut File) -> io::Result<String> {
+/// Stream a file through SHA-256; `None` when it holds more than `limit`
+/// bytes.
+fn hash_file(file: &mut File, limit: u64) -> io::Result<Option<String>> {
     let mut hasher = super::sha256::Sha256::default();
     let mut buffer = vec![0u8; 64 * 1024];
+    let mut total = 0u64;
     loop {
         match file.read(&mut buffer) {
             Ok(0) => break,
-            Ok(n) => hasher.update(&buffer[..n]),
+            Ok(n) => {
+                total += n as u64;
+                if total > limit {
+                    return Ok(None);
+                }
+                hasher.update(&buffer[..n]);
+            }
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
             Err(error) => return Err(error),
         }
     }
-    Ok(hasher.hex())
+    Ok(Some(hasher.hex()))
 }
 
 fn list(path: &Path) -> Outcome<(Vec<Entry>, bool, usize)> {
     let cpath = cstring(path.as_os_str().as_bytes()).map_err(|e| io_error(e, path))?;
     let dir = open_at(libc::AT_FDCWD, &cpath, DIRECTORY, 0).map_err(|e| io_error(e, path))?;
-    let (found, mut truncated) =
-        names(dir.as_raw_fd(), MAX_LIST_SCAN).map_err(|e| io_error(e, path))?;
-    let mut entries = Vec::new();
-    let mut skipped = 0;
+    let (found, mut truncated, skipped) = select(dir.as_raw_fd()).map_err(|e| io_error(e, path))?;
+    let mut entries = Vec::with_capacity(found.len());
     for name in found {
-        // A name that is not UTF-8 cannot be addressed by a JSON path.
         let Ok(text) = name.to_str().map(str::to_owned) else {
-            skipped += 1;
             continue;
         };
         // An entry removed while listing is simply absent.
@@ -500,16 +615,13 @@ fn list(path: &Path) -> Outcome<(Vec<Entry>, bool, usize)> {
         };
         entries.push(entry(text, &st, dir.as_raw_fd(), &name));
     }
-    // Directories first, then everything else, each in byte order of the name.
+    // Directories first, then everything else, each in byte order of the
+    // name (again: an entry may have changed type since it was selected).
     entries.sort_by(|a, b| {
         (a.kind != Kind::Dir)
             .cmp(&(b.kind != Kind::Dir))
             .then_with(|| a.name.cmp(&b.name))
     });
-    if entries.len() > MAX_LIST_ENTRIES {
-        entries.truncate(MAX_LIST_ENTRIES);
-        truncated = true;
-    }
     // Long names and targets with many escapes still fit one record.
     let mut budget = 0usize;
     for (index, item) in entries.iter().enumerate() {
@@ -545,7 +657,15 @@ struct Content {
 fn read(path: &Path, max_bytes: Option<u64>) -> Outcome<Content> {
     let limit = max_bytes.unwrap_or(MAX_READ_BYTES).min(MAX_READ_BYTES);
     let cpath = cstring(path.as_os_str().as_bytes()).map_err(|e| io_error(e, path))?;
-    // O_NONBLOCK keeps a FIFO from blocking before it is refused below.
+    // The type first (following a final symlink, as the read does): opening
+    // a device or FIFO can have side effects, such as releasing a FIFO's
+    // writer or arming a watchdog.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    check(unsafe { libc::fstatat(libc::AT_FDCWD, cpath.as_ptr(), &mut st, 0) })
+        .map_err(|e| io_error(e, path))?;
+    regular(&st, path, "read")?;
+    // O_NONBLOCK and O_NOCTTY limit the effect of an entry swapped for a
+    // FIFO or terminal in between, which the check below then refuses.
     let fd = open_at(
         libc::AT_FDCWD,
         &cpath,
@@ -554,12 +674,7 @@ fn read(path: &Path, max_bytes: Option<u64>) -> Outcome<Content> {
     )
     .map_err(|e| io_error(e, path))?;
     let st = stat_fd(fd.as_raw_fd()).map_err(|e| io_error(e, path))?;
-    if is_dir(&st) {
-        return Err(Error::new(Code::IsADirectory, "a directory has no content").at(path));
-    }
-    if !is_regular(&st) {
-        return Err(Error::new(Code::NotAFile, "not a regular file").at(path));
-    }
+    regular(&st, path, "read")?;
     let too_large = |size: u64| {
         let mut error = Error::new(
             Code::TooLarge,
@@ -634,43 +749,70 @@ fn write(path: &Path, bytes: &[u8], base_hash: Option<&str>, create: bool) -> Ou
     let location = locate(path)?;
     let dir = location.dir.as_raw_fd();
     let name = &location.name;
-    // The file being replaced: never through a symlink, only a regular file
-    // of this user (a replacement would change its owner).
+    let symlink = || Error::new(Code::Symlink, "refusing to write through a symlink").at(path);
+    // The file being replaced, examined without opening it: never through a
+    // symlink, only a regular file of this user (a replacement would change
+    // its owner) that the user may write, as a shell's `>` requires.
     let existing = if create {
         None
     } else {
-        let fd = open_at(
-            dir,
-            name,
-            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY,
-            0,
-        )
-        .map_err(|e| {
-            if e.raw_os_error() == Some(libc::ELOOP) {
-                Error::new(Code::Symlink, "refusing to write through a symlink").at(path)
-            } else {
-                fail(e)
-            }
-        })?;
-        let st = stat_fd(fd.as_raw_fd()).map_err(fail)?;
-        if is_dir(&st) {
-            return Err(Error::new(Code::IsADirectory, "cannot write a directory").at(path));
+        let st = stat_at(dir, name).map_err(fail)?;
+        if is_symlink(&st) {
+            return Err(symlink());
         }
-        if !is_regular(&st) {
-            return Err(Error::new(Code::NotAFile, "not a regular file").at(path));
-        }
-        if st.st_uid != unsafe { libc::geteuid() } {
+        regular(&st, path, "write")?;
+        let euid = unsafe { libc::geteuid() };
+        if st.st_uid != euid {
             return Err(
                 Error::new(Code::PermissionDenied, "the file belongs to another user").at(path),
             );
         }
+        if euid != 0 && st.st_mode & libc::S_IWUSR == 0 {
+            return Err(Error::new(Code::PermissionDenied, "the file is read-only").at(path));
+        }
         if let Some(base) = base_hash {
-            let current = hash_file(&mut File::from(fd)).map_err(fail)?;
-            if !current.eq_ignore_ascii_case(base) {
+            let conflict = |current: Option<String>| {
                 let mut error =
                     Error::new(Code::Conflict, "the file changed since it was read").at(path);
-                error.current_hash = Some(current);
-                return Err(error);
+                error.current_hash = current;
+                error
+            };
+            // A file larger than any read cannot match a hash read from it:
+            // it is a conflict, reported without hashing it.
+            let too_large = || {
+                let mut error = conflict(None);
+                error.message = format!(
+                    "the file is now larger than {MAX_READ_BYTES} bytes, so it changed since it was read"
+                );
+                error.size = Some(st.st_size as u64);
+                error
+            };
+            if st.st_size as u64 > MAX_READ_BYTES {
+                return Err(too_large());
+            }
+            let fd = open_at(
+                dir,
+                name,
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY,
+                0,
+            )
+            .map_err(|e| {
+                if e.raw_os_error() == Some(libc::ELOOP) {
+                    symlink()
+                } else {
+                    fail(e)
+                }
+            })?;
+            let opened = stat_fd(fd.as_raw_fd()).map_err(fail)?;
+            if opened.st_dev != st.st_dev || opened.st_ino != st.st_ino {
+                return Err(conflict(None));
+            }
+            match hash_file(&mut File::from(fd), MAX_READ_BYTES).map_err(fail)? {
+                None => return Err(too_large()),
+                Some(current) if !current.eq_ignore_ascii_case(base) => {
+                    return Err(conflict(Some(current)));
+                }
+                Some(_) => {}
             }
         }
         Some(st)
@@ -690,6 +832,19 @@ fn write(path: &Path, bytes: &[u8], base_hash: Option<&str>, create: bool) -> Ou
         let mut file = File::from(fd);
         file.write_all(bytes).map_err(fail)?;
         if let Some(st) = &existing {
+            // The group first: changing it may clear set-id bits, and the
+            // mode below is set afterwards. A group the user is not a member
+            // of cannot be kept (EPERM); the file then gets the default one.
+            // Extended attributes and ACLs are not carried over.
+            let own = stat_fd(file.as_raw_fd()).map_err(fail)?;
+            if own.st_gid != st.st_gid
+                && unsafe { libc::fchown(file.as_raw_fd(), libc::uid_t::MAX, st.st_gid) } != 0
+            {
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() != Some(libc::EPERM) {
+                    return Err(fail(error));
+                }
+            }
             check(unsafe { libc::fchmod(file.as_raw_fd(), st.st_mode & 0o777) }).map_err(fail)?;
         }
         file.sync_all().map_err(fail)?;
@@ -697,12 +852,20 @@ fn write(path: &Path, bytes: &[u8], base_hash: Option<&str>, create: bool) -> Ou
         match &existing {
             None => rename_noreplace(dir, &temporary, dir, name).map_err(fail)?,
             Some(st) => {
-                // Refuse if the name now points elsewhere (replaced meanwhile).
+                // Refuse if the name now points elsewhere (replaced
+                // meanwhile) or, for a compare-and-swap, if the file changed
+                // in place since it was hashed. What lands between this
+                // check and the rename (microseconds) is still overwritten.
                 let now = stat_at(dir, name).map_err(fail)?;
-                if now.st_dev != st.st_dev || now.st_ino != st.st_ino {
+                let changed = if base_hash.is_some() {
+                    !same_version(&now, st)
+                } else {
+                    now.st_dev != st.st_dev || now.st_ino != st.st_ino
+                };
+                if changed {
                     return Err(Error::new(
                         Code::Conflict,
-                        "the file was replaced while it was being saved",
+                        "the file changed while it was being saved",
                     )
                     .at(path));
                 }
@@ -768,9 +931,9 @@ fn rename(from: &Path, to: &Path, overwrite: bool) -> Outcome<()> {
     Ok(())
 }
 
-/// Remove a directory's contents without following symlinks, in bounded
-/// batches of names.
-fn clear(dir: RawFd, depth: usize, path: &Path) -> Outcome<()> {
+/// Remove a directory's contents without following symlinks or leaving the
+/// file system `dev`, in bounded batches of names.
+fn clear(dir: RawFd, depth: usize, dev: libc::dev_t, path: &Path) -> Outcome<()> {
     if depth >= MAX_DEPTH {
         return Err(Error::new(
             Code::TooLarge,
@@ -783,6 +946,7 @@ fn clear(dir: RawFd, depth: usize, path: &Path) -> Outcome<()> {
         if batch.is_empty() {
             return Ok(());
         }
+        let mut removed = 0;
         for name in batch {
             let child = path.join(OsStr::from_bytes(name.to_bytes()));
             let st = match stat_at(dir, &name) {
@@ -790,37 +954,83 @@ fn clear(dir: RawFd, depth: usize, path: &Path) -> Outcome<()> {
                 Err(error) if error.raw_os_error() == Some(libc::ENOENT) => continue,
                 Err(error) => return Err(io_error(error, &child)),
             };
-            remove_entry(dir, &name, &st, depth, &child)?;
+            if remove_entry(dir, &name, &st, depth, dev, &child)? {
+                removed += 1;
+            }
+        }
+        // A file system that keeps listing names it reports as missing
+        // would otherwise loop forever.
+        if removed == 0 {
+            return Err(Error::new(
+                Code::Io,
+                "the directory keeps listing entries that cannot be removed",
+            )
+            .at(path));
         }
     }
 }
+/// Remove one entry (a directory with its tree); `false` when it was
+/// already gone.
 fn remove_entry(
     dir: RawFd,
     name: &CStr,
     st: &libc::stat,
     depth: usize,
+    dev: libc::dev_t,
     path: &Path,
-) -> Outcome<()> {
+) -> Outcome<bool> {
     let removed = if is_dir(st) {
+        // Like `rm --one-file-system`: a mount point inside the tree stops
+        // the deletion instead of emptying another file system.
+        if st.st_dev != dev {
+            return Err(Error::new(
+                Code::CrossDevice,
+                "refusing to delete across a mount point into another file system",
+            )
+            .at(path));
+        }
         let child =
             open_at(dir, name, DIRECTORY | libc::O_NOFOLLOW, 0).map_err(|e| io_error(e, path))?;
-        clear(child.as_raw_fd(), depth + 1, path)?;
+        clear(child.as_raw_fd(), depth + 1, dev, path)?;
         drop(child);
         unsafe { libc::unlinkat(dir, name.as_ptr(), libc::AT_REMOVEDIR) }
     } else {
         unsafe { libc::unlinkat(dir, name.as_ptr(), 0) }
     };
     match check(removed) {
-        Ok(_) => Ok(()),
-        Err(error) if error.raw_os_error() == Some(libc::ENOENT) => Ok(()),
+        Ok(_) => Ok(true),
+        Err(error) if error.raw_os_error() == Some(libc::ENOENT) => Ok(false),
         Err(error) => Err(io_error(error, path)),
     }
 }
-fn delete(path: &Path) -> Outcome<()> {
+/// Refuse to remove `/` or the server user's home directory itself, under
+/// whatever path names it (`st` is the entry's `lstat`, so a symlink to
+/// either is not protected: removing it removes only the link).
+fn protect(st: &libc::stat, home: Option<&Path>, path: &Path) -> Outcome<()> {
+    for protected in [Some(Path::new("/")), home].into_iter().flatten() {
+        let Ok(name) = cstring(protected.as_os_str().as_bytes()) else {
+            continue;
+        };
+        let mut other: libc::stat = unsafe { std::mem::zeroed() };
+        // Following symlinks: a symlinked HOME protects its directory.
+        if unsafe { libc::fstatat(libc::AT_FDCWD, name.as_ptr(), &mut other, 0) } == 0
+            && (other.st_dev, other.st_ino) == (st.st_dev, st.st_ino)
+        {
+            return Err(Error::new(
+                Code::InvalidRequest,
+                "refusing to remove the root or home directory",
+            )
+            .at(path));
+        }
+    }
+    Ok(())
+}
+fn delete(path: &Path, home: Option<&Path>) -> Outcome<()> {
     let location = locate(path)?;
     let dir = location.dir.as_raw_fd();
     let st = stat_at(dir, &location.name).map_err(|e| io_error(e, path))?;
-    remove_entry(dir, &location.name, &st, 0, path)?;
+    protect(&st, home, path)?;
+    remove_entry(dir, &location.name, &st, 0, st.st_dev, path)?;
     sync_dir(dir);
     Ok(())
 }
@@ -949,10 +1159,11 @@ fn open_trash(settings: &Settings) -> Outcome<Trash> {
 /// with `O_EXCL`, write and sync it, then rename the entry to
 /// `files/<name>` without replacing anything. A failed move removes the
 /// info file again.
-fn trash_one(trash: &Trash, path: &Path) -> Outcome<PathBuf> {
+fn trash_one(trash: &Trash, path: &Path, home: Option<&Path>) -> Outcome<PathBuf> {
     let location = locate(path)?;
     let dir = location.dir.as_raw_fd();
-    stat_at(dir, &location.name).map_err(|e| io_error(e, path))?;
+    let entry = stat_at(dir, &location.name).map_err(|e| io_error(e, path))?;
+    protect(&entry, home, path)?;
     let st = stat_fd(dir).map_err(|e| io_error(e, path))?;
     if st.st_dev != trash.dev {
         return Err(Error::new(
@@ -992,9 +1203,12 @@ fn trash_one(trash: &Trash, path: &Path) -> Outcome<PathBuf> {
             return Err(io_error(error, &trash.root.join("info")));
         }
         drop(file);
+        // The info entry is durable before the payload moves.
+        sync_dir(trash.info.as_raw_fd());
         let target = cstring(candidate.as_bytes()).map_err(|e| io_error(e, path))?;
         match rename_noreplace(dir, &location.name, trash.files.as_raw_fd(), &target) {
             Ok(()) => {
+                sync_dir(trash.files.as_raw_fd());
                 sync_dir(dir);
                 return Ok(trash.root.join("files").join(candidate));
             }
@@ -1163,12 +1377,12 @@ fn run(request: Request, settings: &Settings, home: Option<&Path>) -> Outcome<Ev
                 Err(error) => return Ok(failure(request, error)),
             };
             removal(request, &paths, home, |path| {
-                trash_one(&trash, path).map(Some)
+                trash_one(&trash, path, home).map(Some)
             })
         }
-        Request::FileDelete { request, paths } => {
-            removal(request, &paths, home, |path| delete(path).map(|()| None))
-        }
+        Request::FileDelete { request, paths } => removal(request, &paths, home, |path| {
+            delete(path, home).map(|()| None)
+        }),
         _ => {
             return Err(Error::new(Code::InvalidRequest, "not a file operation"));
         }
@@ -1255,6 +1469,54 @@ mod tests {
         let controls = "\u{1}".repeat(TEXT_BUDGET / 6 + 1);
         let (binary, encoding, _) = content(controls.into_bytes());
         assert_eq!((binary, encoding), (false, Encoding::Base64));
+    }
+    #[test]
+    fn the_home_directory_is_never_removed() {
+        let root =
+            std::env::temp_dir().join(format!("kelpserver-files-unit-{}", std::process::id()));
+        let home = root.join("home");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(home.join("notes")).unwrap();
+        std::fs::write(home.join("notes/a.txt"), "a").unwrap();
+        std::os::unix::fs::symlink(&home, root.join("link")).unwrap();
+        let error = delete(&home, Some(&home)).unwrap_err();
+        assert_eq!(error.code, Code::InvalidRequest);
+        let trash = open_trash(&Settings {
+            trash_dir: Some(root.join("Trash")),
+        })
+        .unwrap();
+        let error = trash_one(&trash, &home, Some(&home)).unwrap_err();
+        assert_eq!(error.code, Code::InvalidRequest);
+        assert!(home.join("notes/a.txt").exists());
+        // A symlink to the home directory is only a link.
+        delete(&root.join("link"), Some(&home)).unwrap();
+        assert!(home.join("notes/a.txt").exists());
+        // Below it, everything can be removed.
+        delete(&home.join("notes"), Some(&home)).unwrap();
+        assert!(!home.join("notes").exists());
+        // `/` has no name to remove.
+        assert_eq!(
+            delete(Path::new("/"), Some(&home)).unwrap_err().code,
+            Code::InvalidPath
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+    #[test]
+    fn versions_compare_inode_size_and_times() {
+        let mut a: libc::stat = unsafe { std::mem::zeroed() };
+        a.st_ino = 7;
+        a.st_size = 3;
+        a.st_mtime = 100;
+        let mut b = a;
+        assert!(same_version(&a, &b));
+        b.st_ctime_nsec = 1;
+        assert!(!same_version(&a, &b));
+        b = a;
+        b.st_mtime_nsec = 1;
+        assert!(!same_version(&a, &b));
+        b = a;
+        b.st_size = 4;
+        assert!(!same_version(&a, &b));
     }
     #[test]
     fn wire_names_match_the_contract() {
