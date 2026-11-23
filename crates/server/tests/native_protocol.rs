@@ -85,3 +85,37 @@ fn malformed_partial_and_oversized_messages_fail_before_allocation_or_dispatch()
         assert!(validate_size(cols, rows).is_ok());
     }
 }
+
+/// Why `binary-screens` is a request after Welcome rather than a Hello field:
+/// a server rejects a Hello with an unknown field, so an older server would
+/// close the connection of a client that announced the format there.
+#[test]
+fn hello_rejects_unknown_fields_and_binary_screens_is_a_request() {
+    let hello = r#"{"Stream":{"type":"hello","version":1,"binary_screens":true}}"#;
+    assert!(serde_json::from_str::<ClientMessage>(hello).is_err());
+    let request = r#"{"Stream":{"type":"binary_screens","enabled":true}}"#;
+    assert!(matches!(
+        serde_json::from_str::<ClientMessage>(request).unwrap(),
+        ClientMessage::Stream(Request::BinaryScreens { enabled: true })
+    ));
+    assert!(stream::CAPABILITIES.contains(&kelpclient_protocol::screens::CAPABILITY));
+}
+
+#[test]
+fn binary_records_are_framed_like_json_and_told_apart_by_their_first_byte() {
+    let mut bytes = Vec::new();
+    write_message(&mut bytes, &ServerMessage::Error("x".into())).unwrap();
+    let record = kelpclient_protocol::screens::RecordBuilder::new().finish();
+    bytes.extend_from_slice(&(record.len() as u32).to_be_bytes());
+    bytes.extend_from_slice(&record);
+    let mut reader = Fragmented(Cursor::new(bytes));
+    assert!(matches!(
+        read_server_record(&mut reader).unwrap(),
+        Some(ServerRecord::Message(ServerMessage::Error(_)))
+    ));
+    let Some(ServerRecord::Screens(screens)) = read_server_record(&mut reader).unwrap() else {
+        panic!("expected a binary record");
+    };
+    assert_eq!(screens, record);
+    assert!(read_server_record(&mut reader).unwrap().is_none());
+}

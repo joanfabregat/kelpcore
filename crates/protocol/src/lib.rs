@@ -1,5 +1,6 @@
 //! Shared wire types; no server, client state, transport, DOM or Unix dependencies.
 pub mod model;
+pub mod screens;
 pub mod types;
 pub use types::*;
 pub const STREAM_PROTOCOL_VERSION: u16 = 1;

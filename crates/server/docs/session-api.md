@@ -120,3 +120,18 @@ KelpServer 0.3.0-beta.2 and `kelpclient-protocol` 0.3.0 remove what step 3 kept 
 - **Kept:** the structured `Vitals` sent in every `Update` and the `Sampler` (including `disk_readings`, the mount paths behind the disk percentages); closed-session records with `Entry::command` and `Entry::previous_command`, which give `resume`/`rerun` their meaning and `ClosedSession.resume`/`rerun` their values; `upgrade::Identity`, `save`, `identify`, `protocol_label` (printed by `kelpserver status`), `speaks_stream` and `LEGACY_COMPOSED_PROTOCOL`, which any client needs to check a running server; `PaneInfo.title`, which is the server's observation of the pane title, not a client name.
 - **Wire effect:** `Update.panes` no longer carries `parked`, `number` or `palette`. The stream version stays 1; a client built against `kelpclient-protocol` 0.2.0 requires `number` and `palette` and must move its pin together with the server. See [native-client-protocol.md](native-client-protocol.md#step-3-generic-server-03).
 - **Tolerant Welcome:** `StartupPanes` gains `Layout` (sent only by 0.2 servers started with `--startup-panes layout`) and `Unknown` (any other value), so a 0.3 client can still attach to, list and stop such a workspace. A 0.3 server still sends only `none`, and `--startup-panes` still accepts only `none`.
+
+## Binary screens (2026-11-22, ADR 0003 section 2)
+
+Screens (snapshots and patches) can be delivered in a compact binary encoding instead of JSON, about 150 times smaller for a text-heavy 300 × 80 screen. It is a transport option of existing session data, not a new operation, so it is a capability like the others. Contract: [binary-screens.md](binary-screens.md).
+
+| Capability | Session or client UI | Addition |
+| --- | --- | --- |
+| Binary screen records | Session (transport) | `binary_screens {enabled}`; each later `update` carries `binary_screens: true` and empty `snapshots`/`patches`, and is immediately followed by one binary record (payload first byte `0x00`) with its screens. Decoder: `kelpclient_protocol::screens`. |
+
+Decisions:
+
+1. **Opt-in request, not a Hello field.** `hello` is decoded with unknown fields denied, so an older server would close a connection whose `hello` names the format. The client checks Welcome for `binary-screens` and then sends `binary_screens`, as with every other opt-in.
+2. **One record after each update.** The JSON `update` and its binary record form one packet in the server's replaceable-update slot, so backpressure replaces both together and a client never has to match screens to metadata across updates. An update without screen changes is still followed by an empty record, so a client's rule is simply "after an `update` with `binary_screens`, read one binary record".
+3. **Whole rows in patches.** The server computes cell changes as before and re-encodes each touched row whole. A row costs a few dozen bytes, so this is simpler than per-cell changes and not larger in practice.
+4. **JSON unchanged.** Connections that do not opt in receive exactly the previous JSON, and the server's JSON path does the same work as before. The stream version stays 1.

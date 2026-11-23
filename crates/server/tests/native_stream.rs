@@ -1,3 +1,4 @@
+use kelpclient_protocol::screens;
 use kelpserver::native::{
     protocol::*,
     server::{ServerConfig, serve},
@@ -894,4 +895,220 @@ fn shell_commands_report_their_start_return_and_alternate_screen() {
     let full = run(b"printf '\\033[?1049hFULL\\033[?1049l'; sleep 3\n", ended);
     assert!(full.alternate_screen, "{full:?}");
     assert!(full.started_at >= ended);
+}
+
+/// A stream client reading records on a thread, optionally with
+/// `binary-screens`. The channel holds one record, so a test that stops
+/// pumping also stops the client from reading its socket.
+struct Observer {
+    records: std::sync::mpsc::Receiver<ServerRecord>,
+    binary: bool,
+    screens: BTreeMap<u64, PaneSnapshot>,
+    /// An update announced a binary record that has not arrived yet.
+    pending: bool,
+    updates: usize,
+    snapshots: usize,
+    patches: usize,
+    socket: UnixStream,
+}
+impl Observer {
+    fn connect(daemon: &Daemon, binary: bool, panes: Vec<u64>) -> Self {
+        let mut socket = daemon.socket();
+        let mut reader = socket.try_clone().unwrap();
+        let keep = socket.try_clone().unwrap();
+        reader.set_read_timeout(None).unwrap();
+        let (sender, records) = std::sync::mpsc::sync_channel(1);
+        thread::spawn(move || {
+            while let Ok(Some(record)) = read_server_record(&mut reader) {
+                if sender.send(record).is_err() {
+                    break;
+                }
+            }
+        });
+        let mut send = |request| {
+            write_message(&mut socket, &ClientMessage::Stream(request)).unwrap();
+        };
+        send(Request::Hello {
+            version: stream::VERSION,
+        });
+        let observer = Self {
+            records,
+            binary,
+            screens: BTreeMap::new(),
+            pending: false,
+            updates: 0,
+            snapshots: 0,
+            patches: 0,
+            socket: keep,
+        };
+        let ServerRecord::Message(ServerMessage::Stream(Event::Welcome { capabilities, .. })) =
+            observer
+                .records
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+        else {
+            panic!("expected welcome");
+        };
+        assert!(capabilities.iter().any(|c| c == screens::CAPABILITY));
+        if binary {
+            send(Request::BinaryScreens { enabled: true });
+        }
+        send(Request::Subscribe { panes });
+        observer
+    }
+    /// Process one record if one arrives within `timeout`.
+    fn pump(&mut self, timeout: Duration) -> bool {
+        let Ok(record) = self.records.recv_timeout(timeout) else {
+            return false;
+        };
+        if self.pending {
+            assert!(
+                matches!(record, ServerRecord::Screens(_)),
+                "a binary update must be followed by its screens"
+            );
+        }
+        match record {
+            ServerRecord::Message(ServerMessage::Stream(Event::Update(update))) => {
+                self.updates += 1;
+                if update.binary_screens {
+                    assert!(self.binary, "binary screens without opting in");
+                    assert!(update.snapshots.is_empty() && update.patches.is_empty());
+                    self.pending = true;
+                } else {
+                    // The opt-in precedes the subscription, so every screen is binary.
+                    assert!(
+                        !self.binary || update.snapshots.is_empty() && update.patches.is_empty()
+                    );
+                    for snapshot in update.snapshots {
+                        self.screens.insert(snapshot.pane, snapshot);
+                    }
+                    for patch in update.patches {
+                        let next = stream::apply(&self.screens[&patch.pane], &patch).unwrap();
+                        self.screens.insert(patch.pane, next);
+                    }
+                }
+            }
+            ServerRecord::Screens(bytes) => {
+                assert!(self.binary && self.pending, "unexpected binary record");
+                self.pending = false;
+                for message in screens::decode(&bytes, screens::DEFAULT_MAX_CELLS).unwrap() {
+                    match message {
+                        screens::ScreenMessage::Snapshot(snapshot) => {
+                            stream::validate(&snapshot).unwrap();
+                            self.snapshots += 1;
+                            self.screens.insert(snapshot.pane, snapshot);
+                        }
+                        screens::ScreenMessage::Patch(patch) => {
+                            let next = patch.apply(&self.screens[&patch.pane]).unwrap();
+                            stream::validate(&next).unwrap();
+                            self.patches += 1;
+                            self.screens.insert(patch.pane, next);
+                        }
+                    }
+                }
+            }
+            ServerRecord::Message(_) => {}
+        }
+        true
+    }
+    fn send(&mut self, request: Request) {
+        write_message(&mut self.socket, &ClientMessage::Stream(request)).unwrap();
+    }
+    fn screen(&self, pane: u64) -> Option<&Screen> {
+        self.screens.get(&pane).map(|snapshot| &snapshot.screen)
+    }
+}
+/// Pump both observers until both show the same quiet screen of `pane`
+/// satisfying `predicate`.
+fn converge(a: &mut Observer, b: &mut Observer, pane: u64, predicate: impl Fn(&Screen) -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut quiet = 0;
+    loop {
+        let progressed = a.pump(Duration::from_millis(40)) | b.pump(Duration::from_millis(40));
+        quiet = if progressed { 0 } else { quiet + 1 };
+        if quiet >= 5
+            && !a.pending
+            && !b.pending
+            && a.screen(pane).is_some_and(&predicate)
+            && a.screen(pane) == b.screen(pane)
+        {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "screens did not converge:\nA {:?}\nB {:?}",
+            a.screen(pane).map(text),
+            b.screen(pane).map(text)
+        );
+    }
+}
+
+#[test]
+fn binary_screens_decode_to_the_screens_json_clients_receive() {
+    let daemon = Daemon::start();
+    let mut json = Observer::connect(&daemon, false, vec![1]);
+    let mut binary = Observer::connect(&daemon, true, vec![1]);
+    let mut control = daemon.peer();
+    control.lease(1, false);
+    // Colours, a hyperlink, wide and combining characters.
+    control.send(Request::Input {
+        pane: 1,
+        bytes: "printf '\\033[1;31mred\\033[0m \\033[48;2;10;20;30mrgb\\033[0m 漢字 e\\314\\201 \\033]8;;https://example.com/x\\033\\\\link\\033]8;;\\033\\\\ %s\\n' MARK_ONE\n"
+            .as_bytes()
+            .to_vec(),
+    });
+    converge(&mut json, &mut binary, 1, |s| {
+        text(s).contains("MARK_ONE")
+            && s.cells.iter().any(|c| c.width == 2)
+            && s.cells.iter().any(|c| c.hyperlink.is_some())
+    });
+    // Small changes arrive as row patches.
+    control.send(Request::Input {
+        pane: 1,
+        bytes: b"echo MARK_TWO\n".to_vec(),
+    });
+    converge(&mut json, &mut binary, 1, |s| text(s).contains("MARK_TWO"));
+    assert!(binary.patches > 0, "no binary patch was exercised");
+    // A resize produces a full snapshot.
+    let before = binary.snapshots;
+    control.send(Request::Resize {
+        pane: 1,
+        cols: 160,
+        rows: 50,
+    });
+    converge(&mut json, &mut binary, 1, |s| s.cols == 160 && s.rows == 50);
+    assert!(binary.snapshots > before);
+    // Backpressure: the binary client stops reading while a large pane
+    // changes continuously. Its socket fills, so the server keeps replacing
+    // its one pending update (with snapshots) instead of queueing every
+    // frame. The JSON client unsubscribes meanwhile so that the server's
+    // frame rate does not depend on JSON encoding of the large pane.
+    json.send(Request::Subscribe { panes: vec![] });
+    control.send(Request::Resize {
+        pane: 1,
+        cols: 400,
+        rows: 150,
+    });
+    control.send(Request::Input {
+        pane: 1,
+        bytes: b"l=abcdefghijklmnopqrstuvwxyz0123456789; l=$l$l$l$l$l$l$l$l$l$l; i=0; end=$(($(date +%s) + 2)); while [ \"$(date +%s)\" -lt \"$end\" ]; do printf '\\033[3%dm%d %s\\033[0m\\n' $((i % 8)) \"$i\" \"$l\"; i=$((i+1)); done; echo MARK_''DONE\n".to_vec(),
+    });
+    let binary_before = binary.updates;
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_millis(3000) {
+        json.pump(Duration::from_millis(20));
+    }
+    json.send(Request::Subscribe { panes: vec![1] });
+    converge(&mut json, &mut binary, 1, |s| {
+        s.cols == 400 && text(s).contains("MARK_DONE")
+    });
+    // The output (1–2 s, 30 frames a second) ended while paused; a client
+    // without replacement would receive every frame.
+
+    let received = binary.updates - binary_before;
+    assert!(
+        received < 20,
+        "the paused client received {received} updates; expected coalescing"
+    );
+    assert!(json.snapshots == 0 && json.patches == 0);
 }

@@ -136,6 +136,8 @@ impl Incoming {
                 } else if matches!(request, stream::Request::Hello { .. }) {
                     return Err("duplicate bridge hello".into());
                 }
+            } else if self.initialized && kelpclient_protocol::screens::is_binary_record(payload) {
+                // `binary-screens` records are relayed unchanged, unparsed.
             } else {
                 match serde_json::from_slice::<ServerMessage>(payload)
                     .map_err(|_| "workspace did not speak the native stream protocol")?

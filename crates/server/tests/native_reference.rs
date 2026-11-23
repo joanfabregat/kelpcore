@@ -51,6 +51,7 @@ fn update() -> Update {
         vitals: Default::default(),
         sessions: vec![],
         host: None,
+        binary_screens: false,
     }
 }
 fn state() -> State {
