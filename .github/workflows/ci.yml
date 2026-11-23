@@ -97,7 +97,7 @@ jobs:
             all(.packages[];
               . as $package |
               (["MIT", "Apache-2.0", "MIT OR Apache-2.0", "Apache-2.0 OR MIT", "Unlicense OR MIT"] | index($package.license) != null)
-              # gzip for file downloads: flate2's pure-Rust backend (miniz_oxide,
+              # gzip for file downloads: the pure-Rust flate2 backend (miniz_oxide,
               # adler2), each also offered under MIT and Apache-2.0.
               or (["0BSD OR MIT OR Apache-2.0", "MIT OR Zlib OR Apache-2.0"] | index($package.license) != null)
               or ($package.name == "unicode-ident" and $package.license == "(MIT OR Apache-2.0) AND Unicode-3.0")
