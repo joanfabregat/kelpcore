@@ -82,6 +82,13 @@ test("file limits are read from the Welcome and checked", () => {
   assert.equal(readFileLimits({ ...limits, max_depth: "64" }), null);
   const { max_in_flight, ...missing } = limits;
   assert.equal(readFileLimits(missing), null);
+  // The file root, when advertised and well formed.
+  assert.equal(readFileLimits(limits).root, undefined);
+  assert.equal(readFileLimits({ ...limits, root: "/home/me" }).root, "/home/me");
+  assert.equal(readFileLimits({ ...limits, root: "/" }).root, "/");
+  for (const bad of ["relative", "", 7, "/a\0b", "/" + "x".repeat(4096)])
+    assert.equal(readFileLimits({ ...limits, root: bad }).root, undefined);
+  assert.equal(describeCode("outside_root"), "Outside the folders this server lets you browse");
 });
 
 test("file events are recognised by type or by the request they answer", () => {

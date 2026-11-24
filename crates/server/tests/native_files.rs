@@ -22,7 +22,13 @@ struct Daemon {
     thread: Option<thread::JoinHandle<kelpserver::Result<()>>>,
 }
 impl Daemon {
+    /// A server whose file root is the test's folder.
     fn start() -> Self {
+        Self::start_with(|root| Some(root.to_path_buf()))
+    }
+    /// A server whose file root is `root(test folder)` (`None`: the home
+    /// directory, the default).
+    fn start_with(files_root: impl FnOnce(&Path) -> Option<PathBuf>) -> Self {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let root = std::env::temp_dir().join(format!(
             "kelpserver-files-{}-{}",
@@ -30,6 +36,8 @@ impl Daemon {
             NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         fs::create_dir(&root).unwrap();
+        // Replies spell paths from the canonical root.
+        let root = fs::canonicalize(&root).unwrap();
         let state = root.join("state");
         fs::create_dir(&state).unwrap();
         fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
@@ -44,6 +52,7 @@ impl Daemon {
             uploads: Default::default(),
             files: files::Settings {
                 trash_dir: Some(root.join("data/Trash")),
+                root: files_root(&root),
             },
         };
         let handle = thread::spawn(move || serve(config));
@@ -327,7 +336,13 @@ fn files_capability_and_limits_are_advertised() {
         } => {
             assert!(capabilities.iter().any(|c| c == "files"));
             let limits = file_limits.unwrap();
-            assert_eq!(limits, files::LIMITS);
+            assert_eq!(
+                limits,
+                files::Limits {
+                    root: Some(text(&daemon.root)),
+                    ..files::LIMITS
+                }
+            );
             assert_eq!(limits.max_read_bytes, 8 * 1024 * 1024);
             assert_eq!(limits.max_list_entries, 5000);
             assert_eq!(limits.max_in_flight, 4);
@@ -373,7 +388,10 @@ fn list_stat_read_and_write_round_trip() {
     let (path, entry) = peer.stat(&format!("{}//./link/", text(&work))).unwrap();
     assert_eq!(path, text(&work.join("link")));
     assert_eq!(entry.kind, Kind::Symlink);
-    assert_eq!(peer.stat("/").unwrap().1.name, "/");
+    // The root itself can be stat'ed; `/` is outside it.
+    let (path, entry) = peer.stat(&text(&daemon.root)).unwrap();
+    assert_eq!((path, entry.kind), (text(&daemon.root), Kind::Dir));
+    assert_eq!(peer.stat("/").unwrap_err().code, Code::OutsideRoot);
     assert_eq!(
         peer.stat(&text(&work.join("missing"))).unwrap_err().code,
         Code::NotFound
@@ -609,7 +627,11 @@ fn mkdir_creates_one_directory() {
     );
     assert_eq!(
         peer.mkdir(Path::new("/")).unwrap_err().code,
-        Code::InvalidPath
+        Code::OutsideRoot
+    );
+    assert_eq!(
+        peer.mkdir(&daemon.root).unwrap_err().code,
+        Code::InvalidRequest
     );
 }
 
@@ -946,26 +968,33 @@ fn binary_files_round_trip_as_base64() {
 
 #[test]
 fn home_relative_and_invalid_paths() {
-    let daemon = Daemon::start();
+    // The default root: the home directory, which `~` names.
+    let Some(home) = files::home().and_then(|home| fs::canonicalize(home).ok()) else {
+        return;
+    };
+    let daemon = Daemon::start_with(|_| None);
     let mut peer = daemon.peer();
-    if let Some(home) = files::home() {
-        let (path, entry) = peer.stat("~").unwrap();
-        assert_eq!(
-            Path::new(&path),
-            files::normalize("~", Some(&home)).unwrap()
-        );
-        assert_eq!(entry.kind, Kind::Dir);
-        let (path, _) = peer.stat("~/").unwrap();
-        assert_eq!(Path::new(&path), home.components().collect::<PathBuf>());
-        match peer.call(|request| Request::FileList {
-            request,
-            path: "~".into(),
-        }) {
-            Event::FileList { path, .. } => {
-                assert_eq!(Path::new(&path), home.components().collect::<PathBuf>())
-            }
-            other => panic!("{other:?}"),
+    match peer.welcome.clone().unwrap() {
+        Event::Welcome { file_limits, .. } => {
+            assert_eq!(file_limits.unwrap().root, Some(text(&home)));
         }
+        other => panic!("{other:?}"),
+    }
+    let (path, entry) = peer.stat("~").unwrap();
+    assert_eq!(Path::new(&path), home);
+    assert_eq!(entry.kind, Kind::Dir);
+    let (path, _) = peer.stat("~/").unwrap();
+    assert_eq!(Path::new(&path), home);
+    match peer.call(|request| Request::FileList {
+        request,
+        path: "~".into(),
+    }) {
+        Event::FileList { path, .. } => assert_eq!(Path::new(&path), home),
+        other => panic!("{other:?}"),
+    }
+    // Outside the home directory, nothing is reachable.
+    if home != Path::new("/") {
+        assert_eq!(peer.stat("/").unwrap_err().code, Code::OutsideRoot);
     }
     for bad in ["relative/x", "/a/../b", "~someone/x", ""] {
         let error = peer.stat(bad).unwrap_err();
@@ -1085,4 +1114,272 @@ fn a_burst_of_refused_requests_keeps_the_connection() {
     assert!(busy > 0);
     let (_, entry) = peer.stat(&text(&work)).unwrap();
     assert_eq!(entry.kind, Kind::Dir);
+}
+
+/// A server confined to `work`, with a sibling folder `outside` holding
+/// `secret.txt`.
+fn confined() -> (Daemon, PathBuf, PathBuf) {
+    let daemon = Daemon::start_with(|root| Some(root.join("work")));
+    let work = daemon.work();
+    let outside = daemon.root.join("outside");
+    fs::create_dir(&outside).unwrap();
+    fs::write(outside.join("secret.txt"), "secret").unwrap();
+    (daemon, work, outside)
+}
+fn code_of(event: Event) -> Code {
+    match event {
+        Event::FileError { error, .. } => error.code,
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn every_operation_outside_the_root_is_refused() {
+    let (daemon, work, outside) = confined();
+    let mut peer = daemon.peer();
+    match peer.welcome.clone().unwrap() {
+        Event::Welcome { file_limits, .. } => {
+            assert_eq!(file_limits.unwrap().root, Some(text(&work)));
+        }
+        other => panic!("{other:?}"),
+    }
+    fs::write(work.join("a.txt"), "a").unwrap();
+    let secret = outside.join("secret.txt");
+    // A sibling whose name starts like the root's is outside too.
+    let sibling = daemon.root.join("workx");
+    fs::create_dir(&sibling).unwrap();
+    fs::write(sibling.join("b.txt"), "b").unwrap();
+    for path in [
+        &outside,
+        &secret,
+        &sibling,
+        &sibling.join("b.txt"),
+        &daemon.root,
+    ] {
+        let error = peer.stat(&text(path)).unwrap_err();
+        assert_eq!(error.code, Code::OutsideRoot, "{path:?}");
+        assert_eq!(error.path.as_deref(), Some(text(path).as_str()));
+    }
+    assert_eq!(
+        code_of(peer.call(|request| Request::FileList {
+            request,
+            path: text(&outside),
+        })),
+        Code::OutsideRoot
+    );
+    assert_eq!(
+        peer.read(&secret, None).unwrap_err().code,
+        Code::OutsideRoot
+    );
+    assert_eq!(
+        peer.write(&secret, "changed", None, false)
+            .unwrap_err()
+            .code,
+        Code::OutsideRoot
+    );
+    assert_eq!(
+        peer.write(&outside.join("new.txt"), "x", None, true)
+            .unwrap_err()
+            .code,
+        Code::OutsideRoot
+    );
+    assert_eq!(
+        peer.mkdir(&outside.join("d")).unwrap_err().code,
+        Code::OutsideRoot
+    );
+    // Neither end of a rename may be outside.
+    assert_eq!(
+        peer.rename(&work.join("a.txt"), &outside.join("a.txt"), false)
+            .unwrap_err()
+            .code,
+        Code::OutsideRoot
+    );
+    assert_eq!(
+        peer.rename(&secret, &work.join("secret.txt"), false)
+            .unwrap_err()
+            .code,
+        Code::OutsideRoot
+    );
+    // Trash and delete check every path first: one outside refuses all.
+    for trash in [true, false] {
+        let paths = vec![text(&work.join("a.txt")), text(&secret)];
+        let event = peer.call(|request| {
+            if trash {
+                Request::FileTrash { request, paths }
+            } else {
+                Request::FileDelete { request, paths }
+            }
+        });
+        assert_eq!(code_of(event), Code::OutsideRoot);
+    }
+    assert!(work.join("a.txt").exists());
+    assert_eq!(fs::read_to_string(&secret).unwrap(), "secret");
+    assert!(!outside.join("new.txt").exists() && !outside.join("d").exists());
+    // `..` is never accepted, and `~` (the home directory) is outside here.
+    let error = peer
+        .stat(&format!("{}/../outside/secret.txt", text(&work)))
+        .unwrap_err();
+    assert_eq!(error.code, Code::InvalidPath);
+    if files::home().is_some_and(|home| !work.starts_with(home)) {
+        assert_eq!(peer.stat("~").unwrap_err().code, Code::OutsideRoot);
+    }
+}
+
+#[test]
+fn the_root_can_be_browsed_but_not_changed() {
+    let (daemon, work, _) = confined();
+    let mut peer = daemon.peer();
+    fs::write(work.join("a.txt"), "a").unwrap();
+    let (entries, _) = peer.list(&work);
+    assert_eq!(entries.len(), 1);
+    let (path, entry) = peer.stat(&text(&work)).unwrap();
+    assert_eq!(
+        (path, entry.kind, entry.name),
+        (text(&work), Kind::Dir, "work".into())
+    );
+    for trash in [true, false] {
+        let (removed, failed) = peer.remove(trash, &[&work]);
+        assert!(removed.is_empty());
+        assert_eq!(failed, [(text(&work), Code::InvalidRequest)]);
+    }
+    assert_eq!(
+        peer.rename(&work, &work.join("moved"), false)
+            .unwrap_err()
+            .code,
+        Code::InvalidRequest
+    );
+    assert_eq!(
+        peer.rename(&work.join("a.txt"), &work, true)
+            .unwrap_err()
+            .code,
+        Code::InvalidRequest
+    );
+    assert_eq!(
+        peer.write(&work, "x", None, false).unwrap_err().code,
+        Code::InvalidRequest
+    );
+    assert!(work.join("a.txt").exists());
+    // A symlink to the root inside it is only a link: removing it keeps the
+    // root and its contents.
+    symlink(&work, work.join("self")).unwrap();
+    let (removed, failed) = peer.remove(false, &[&work.join("self")]);
+    assert_eq!((removed.len(), failed.len()), (1, 0));
+    assert!(work.join("a.txt").exists());
+}
+
+#[test]
+fn symlinks_out_of_the_root_are_listed_but_never_followed() {
+    let (daemon, work, outside) = confined();
+    let mut peer = daemon.peer();
+    // Links out: absolute and relative, to a folder and to a file, and to
+    // /etc.
+    symlink(&outside, work.join("out")).unwrap();
+    symlink("../outside", work.join("rel-out")).unwrap();
+    symlink(outside.join("secret.txt"), work.join("secret-link")).unwrap();
+    symlink("/etc", work.join("etc")).unwrap();
+    // Links in: absolute and relative.
+    fs::create_dir(work.join("dir")).unwrap();
+    fs::write(work.join("dir/f.txt"), "inside").unwrap();
+    symlink(work.join("dir"), work.join("in")).unwrap();
+    symlink("dir/f.txt", work.join("file-in")).unwrap();
+    symlink("../dir", work.join("dir/up")).unwrap();
+
+    // Listed and stat'ed as links, with their targets.
+    let (entries, _) = peer.list(&work);
+    let target = |name: &str| {
+        let entry = entries.iter().find(|entry| entry.name == name).unwrap();
+        assert_eq!(entry.kind, Kind::Symlink, "{name}");
+        entry.target.clone().unwrap()
+    };
+    assert_eq!(target("out"), text(&outside));
+    assert_eq!(target("rel-out"), "../outside");
+    assert_eq!(target("etc"), "/etc");
+    let (_, entry) = peer.stat(&text(&work.join("etc"))).unwrap();
+    assert_eq!(
+        (entry.kind, entry.target.as_deref()),
+        (Kind::Symlink, Some("/etc"))
+    );
+
+    // Nothing is reached through them.
+    for link in ["out", "rel-out"] {
+        let through = work.join(link);
+        let listed = peer.call(|request| Request::FileList {
+            request,
+            path: text(&through),
+        });
+        assert_eq!(code_of(listed), Code::OutsideRoot, "{link}");
+        let secret = through.join("secret.txt");
+        assert_eq!(
+            peer.stat(&text(&secret)).unwrap_err().code,
+            Code::OutsideRoot
+        );
+        assert_eq!(
+            peer.read(&secret, None).unwrap_err().code,
+            Code::OutsideRoot
+        );
+        assert_eq!(
+            peer.write(&secret, "x", None, false).unwrap_err().code,
+            Code::OutsideRoot
+        );
+        assert_eq!(
+            peer.write(&through.join("new.txt"), "x", None, true)
+                .unwrap_err()
+                .code,
+            Code::OutsideRoot
+        );
+        assert_eq!(
+            peer.mkdir(&through.join("d")).unwrap_err().code,
+            Code::OutsideRoot
+        );
+        assert_eq!(
+            peer.rename(&work.join("dir/f.txt"), &through.join("f.txt"), false)
+                .unwrap_err()
+                .code,
+            Code::OutsideRoot
+        );
+        let (removed, failed) = peer.remove(false, &[&secret]);
+        assert!(removed.is_empty());
+        assert_eq!(failed, [(text(&secret), Code::OutsideRoot)]);
+    }
+    assert_eq!(
+        peer.read(&work.join("secret-link"), None).unwrap_err().code,
+        Code::OutsideRoot
+    );
+    assert_eq!(
+        peer.read(&work.join("etc/passwd"), None).unwrap_err().code,
+        Code::OutsideRoot
+    );
+    // Writing to a final symlink is refused as before, wherever it points.
+    assert_eq!(
+        peer.write(&work.join("secret-link"), "x", None, false)
+            .unwrap_err()
+            .code,
+        Code::Symlink
+    );
+    assert_eq!(
+        fs::read_to_string(outside.join("secret.txt")).unwrap(),
+        "secret"
+    );
+    assert_eq!(fs::read_dir(&outside).unwrap().count(), 1);
+    assert!(work.join("dir/f.txt").exists());
+
+    // Links that stay inside work like folders and files.
+    assert_eq!(
+        peer.read(&work.join("in/f.txt"), None).unwrap().2,
+        b"inside"
+    );
+    assert_eq!(peer.read(&work.join("file-in"), None).unwrap().2, b"inside");
+    assert_eq!(
+        peer.read(&work.join("in/up/up/f.txt"), None).unwrap().2,
+        b"inside"
+    );
+    assert_eq!(peer.list(&work.join("in")).0.len(), 2);
+    peer.write(&work.join("in/g.txt"), "g", None, true).unwrap();
+    assert_eq!(fs::read_to_string(work.join("dir/g.txt")).unwrap(), "g");
+    // Deleting or trashing a link out removes the link only.
+    let (removed, _) = peer.remove(true, &[&work.join("out")]);
+    assert_eq!(removed.len(), 1);
+    let (removed, _) = peer.remove(false, &[&work.join("rel-out")]);
+    assert_eq!(removed.len(), 1);
+    assert!(outside.join("secret.txt").exists());
 }

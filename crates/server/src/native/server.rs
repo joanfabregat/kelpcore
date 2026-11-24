@@ -38,7 +38,7 @@ pub struct ServerConfig {
     pub rows: u16,
     /// Upload directory and retention (`uploads`).
     pub uploads: super::uploads::Settings,
-    /// File operations (`files`): the trash location.
+    /// File operations (`files`): the trash location and the file root.
     pub files: super::files::Settings,
 }
 /// A finished file operation: the connection, whether it was a deletion, and
@@ -54,15 +54,19 @@ struct FileJobs {
     deletes: usize,
     sender: std::sync::mpsc::Sender<FileResult>,
     receiver: std::sync::mpsc::Receiver<FileResult>,
+    /// The folder file operations, downloads and upload destinations are
+    /// confined to, resolved at startup; `None` when it could not be.
+    root: Option<super::files::Root>,
 }
 impl FileJobs {
-    fn new() -> Self {
+    fn new(root: Option<super::files::Root>) -> Self {
         let (sender, receiver) = std::sync::mpsc::channel();
         Self {
             running: BTreeMap::new(),
             deletes: 0,
             sender,
             receiver,
+            root,
         }
     }
     fn release(&mut self, id: u64, count: usize) {
@@ -1077,7 +1081,14 @@ impl Server {
                 limits: Some(super::stream::LIMITS),
                 notification_run: Some(self.activity.run().to_owned()),
                 upload_limits: Some(super::uploads::LIMITS),
-                file_limits: Some(super::files::LIMITS),
+                file_limits: Some(super::files::Limits {
+                    root: self
+                        .files
+                        .root
+                        .as_ref()
+                        .map(|root| super::files::path_text(root.path())),
+                    ..super::files::LIMITS
+                }),
             };
             let client = self.clients.get_mut(&id).unwrap();
             if client.stream.is_some() {
@@ -1489,7 +1500,9 @@ impl Server {
                 files,
                 dest,
             } => {
-                let (batch, dir) = self.uploads.begin(id, &files, dest.as_deref())?;
+                let (batch, dir) =
+                    self.uploads
+                        .begin(id, &files, dest.as_deref(), self.files.root.as_ref())?;
                 return self.reply(
                     id,
                     Event::UploadStarted {
@@ -1593,10 +1606,12 @@ impl Server {
         } else {
             let sender = self.files.sender.clone();
             let settings = self.config.files.clone();
+            let root = self.files.root.clone();
             std::thread::Builder::new()
                 .name("kelpserver-files".into())
                 .spawn(move || {
-                    let _ = sender.send((id, delete, files::execute(request, &settings)));
+                    let event = files::execute(request, &settings, root.as_ref());
+                    let _ = sender.send((id, delete, event));
                 })
                 .err()
                 .map(|error| error.to_string())
@@ -1671,7 +1686,12 @@ impl Server {
                     ),
                 )
             } else {
-                match downloads::start(paths, archive, &self.downloads.threads) {
+                match downloads::start(
+                    paths,
+                    archive,
+                    self.files.root.clone(),
+                    &self.downloads.threads,
+                ) {
                     Ok(job) => {
                         self.downloads.next += 1;
                         self.downloads.active.insert(
@@ -2855,6 +2875,15 @@ pub fn serve(config: ServerConfig) -> Result<()> {
     super::lifecycle::save_pid(&config.state_dir)?;
     let mut uploads = super::uploads::Uploads::new(&config.state_dir, &config.uploads)?;
     uploads.sweep(crate::now());
+    // Terminals do not depend on it: without a root, file operations are
+    // refused (`outside_root`) and the server still runs.
+    let file_root = match super::files::Root::new(config.files.root.as_deref()) {
+        Ok(root) => Some(root),
+        Err(error) => {
+            eprintln!("kelpserver: file operations are disabled: {error}");
+            None
+        }
+    };
     let mut server = Server {
         history: super::history::History::load(&config.state_dir.join("tab-history.json"))?,
         epoch: fs::read_to_string("/proc/sys/kernel/random/uuid")?
@@ -2881,7 +2910,7 @@ pub fn serve(config: ServerConfig) -> Result<()> {
         panes: BTreeMap::new(),
         clients: BTreeMap::new(),
         uploads,
-        files: FileJobs::new(),
+        files: FileJobs::new(file_root),
         downloads: Downloads::default(),
         next_pane: 1,
         spawn_requests: BTreeMap::new(),

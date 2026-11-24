@@ -17,6 +17,8 @@ struct Options {
     command: Vec<String>,
     background: bool,
     uploads: super::uploads::Settings,
+    /// `--files-root`: the folder file operations are confined to.
+    files_root: Option<PathBuf>,
 }
 fn options(args: &[String]) -> Result<Options> {
     let state = super::lifecycle::workspace_path("main")?;
@@ -33,6 +35,7 @@ fn options(args: &[String]) -> Result<Options> {
         command: vec![],
         background: false,
         uploads: Default::default(),
+        files_root: None,
     };
     let verb = args.first().ok_or("missing native command")?;
     let mut position = 1;
@@ -84,6 +87,9 @@ fn options(args: &[String]) -> Result<Options> {
                 }
                 "--upload-dir" if matches!(verb.as_str(), "server" | "start") => {
                     result.uploads.dir = Some(PathBuf::from(value));
+                }
+                "--files-root" if matches!(verb.as_str(), "server" | "start") => {
+                    result.files_root = Some(PathBuf::from(value));
                 }
                 "--upload-retention-days" if matches!(verb.as_str(), "server" | "start") => {
                     let days: u32 = value
@@ -151,6 +157,9 @@ fn options(args: &[String]) -> Result<Options> {
     if result.uploads.retention_days.is_none() {
         result.uploads.retention_days = settings.upload_retention_days;
     }
+    if result.files_root.is_none() {
+        result.files_root = settings.files_root;
+    }
     if let Some(cwd) = settings.cwd {
         if !cwd_explicit {
             result.cwd = cwd;
@@ -170,6 +179,9 @@ fn options(args: &[String]) -> Result<Options> {
     result.cwd = absolute(&result.cwd)?;
     if let Some(dir) = &result.uploads.dir {
         result.uploads.dir = Some(absolute(dir)?);
+    }
+    if let Some(root) = &result.files_root {
+        result.files_root = Some(absolute(root)?);
     }
     Ok(result)
 }
@@ -196,7 +208,10 @@ pub fn run(args: &[String]) -> Result<()> {
                 cols: options.size.0,
                 rows: options.size.1,
                 uploads: options.uploads,
-                files: Default::default(),
+                files: super::files::Settings {
+                    root: options.files_root,
+                    ..Default::default()
+                },
             })
         }
         "start" => {
@@ -208,6 +223,10 @@ pub fn run(args: &[String]) -> Result<()> {
                     &options.state.join("workspace.json"),
                     &options.uploads,
                 )?;
+            }
+            if let Some(root) = &options.files_root {
+                super::lifecycle::private_state(&options.state)?;
+                super::lifecycle::persist_files_root(&options.state.join("workspace.json"), root)?;
             }
             super::lifecycle::start(super::lifecycle::StartRequest {
                 socket: &options.socket,

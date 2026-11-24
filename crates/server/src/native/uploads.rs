@@ -8,7 +8,10 @@
 //!
 //! Every batch is a new private (0700) directory under the upload root
 //! (`$XDG_CACHE_HOME/kelpserver/uploads` by default) or under a client-chosen
-//! existing directory owned by the server's user. Files are written to private
+//! existing directory owned by the server's user inside the file root
+//! (`files::Root`, resolved beneath it like every file operation). The
+//! upload root itself is server configuration and need not lie inside the
+//! file root. Files are written to private
 //! temporary names (0600, `O_EXCL`, `O_NOFOLLOW`), synced and renamed into
 //! place without overwriting. All file operations are relative to directory
 //! descriptors opened without following a symlink at the final component.
@@ -554,12 +557,14 @@ impl Uploads {
             self.sweep(crate::now());
         }
     }
-    /// Start a batch for a connection; returns its ID and directory.
+    /// Start a batch for a connection; returns its ID and directory. A
+    /// `dest` must lie inside `files_root`, the server's file root.
     pub fn begin(
         &mut self,
         client: u64,
         files: &[FileSpec],
         dest: Option<&Path>,
+        files_root: Option<&super::files::Root>,
     ) -> Result<(u64, PathBuf)> {
         if files.is_empty() || files.len() > MAX_FILES {
             return Err(format!("an upload holds 1 to {MAX_FILES} files").into());
@@ -592,11 +597,28 @@ impl Uploads {
                 {
                     return Err("upload destination must be an absolute normalized path".into());
                 }
-                let fd = owned_directory_at(dest).ok_or(
+                // A client-chosen destination is confined like every file
+                // operation: inside the file root, opened beneath it.
+                let files_root = files_root.ok_or_else(|| super::files::no_root().message)?;
+                let dest = files_root.confine(dest).map_err(|_| {
+                    format!(
+                        "upload destination is outside the file root {}",
+                        files_root.path().display()
+                    )
+                })?;
+                let fd = super::files::open_path(
+                    files_root,
+                    &dest,
+                    libc::O_RDONLY | libc::O_DIRECTORY,
+                    false,
+                )
+                .ok()
+                .filter(|fd| owned_directory(fd).is_ok())
+                .ok_or(
                     "upload destination must be an existing directory owned by this user, \
                      not a symlink",
                 )?;
-                (dest.to_path_buf(), fd)
+                (dest, fd)
             }
             None => {
                 let (path, private) = match &self.root {

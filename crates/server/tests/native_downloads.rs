@@ -34,6 +34,8 @@ impl Daemon {
             NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         fs::create_dir(&root).unwrap();
+        // Replies spell paths from the canonical root.
+        let root = fs::canonicalize(&root).unwrap();
         let state = root.join("state");
         fs::create_dir(&state).unwrap();
         fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
@@ -46,8 +48,10 @@ impl Daemon {
             cols: 80,
             rows: 24,
             uploads: Default::default(),
+            // The file root is the test's working folder.
             files: files::Settings {
                 trash_dir: Some(root.join("data/Trash")),
+                root: Some(root.join("work")),
             },
         };
         let handle = thread::spawn(move || serve(config));
@@ -513,8 +517,82 @@ fn a_single_file_downloads_as_itself() {
             .err()
             .unwrap()
             .code,
-        Code::InvalidPath
+        Code::OutsideRoot
     );
+}
+
+#[test]
+fn downloads_stay_inside_the_root() {
+    let daemon = Daemon::start();
+    let mut peer = daemon.peer();
+    let work = daemon.work();
+    let outside = daemon.root.join("outside");
+    fs::create_dir(&outside).unwrap();
+    fs::write(outside.join("secret.txt"), "secret").unwrap();
+    fs::create_dir(work.join("project")).unwrap();
+    fs::write(work.join("project/a.txt"), "a").unwrap();
+    symlink(&outside, work.join("project/out")).unwrap();
+    symlink(outside.join("secret.txt"), work.join("secret-link")).unwrap();
+    symlink("/etc", work.join("etc")).unwrap();
+    let code = |peer: &mut Peer, paths: &[&Path], archive| {
+        peer.download(paths, archive).err().unwrap().code
+    };
+    // Outside, directly or through a link, as a file or an archive.
+    for archive in [None, Some(Archive::TarGz)] {
+        assert_eq!(
+            code(&mut peer, &[&outside.join("secret.txt")], archive),
+            Code::OutsideRoot
+        );
+        assert_eq!(
+            code(&mut peer, &[&work.join("project/out/secret.txt")], archive),
+            Code::OutsideRoot
+        );
+        assert_eq!(
+            code(&mut peer, &[&work.join("etc/passwd")], archive),
+            Code::OutsideRoot
+        );
+    }
+    assert_eq!(
+        code(&mut peer, &[&work.join("secret-link")], None),
+        Code::OutsideRoot
+    );
+    assert_eq!(
+        code(&mut peer, &[&outside], Some(Archive::TarGz)),
+        Code::OutsideRoot
+    );
+    // One path outside refuses the whole selection.
+    assert_eq!(
+        code(
+            &mut peer,
+            &[&work.join("project"), &outside],
+            Some(Archive::TarGz)
+        ),
+        Code::OutsideRoot
+    );
+    // The root itself is not downloaded; its entries are.
+    assert_eq!(
+        code(&mut peer, &[&work], Some(Archive::TarGz)),
+        Code::InvalidRequest
+    );
+    // An archive stores a link out as a link, never its target; selected
+    // itself, a link is stored the same way.
+    let got = peer
+        .download(
+            &[&work.join("project"), &work.join("secret-link")],
+            Some(Archive::TarGz),
+        )
+        .unwrap();
+    let members: BTreeMap<String, Member> = untar(&got.bytes)
+        .into_iter()
+        .map(|(name, member)| (String::from_utf8(name).unwrap(), member))
+        .collect();
+    let link = members.get("project/out").unwrap();
+    assert_eq!(
+        (link.kind, link.link.clone()),
+        (b'2', text(&outside).into_bytes())
+    );
+    assert_eq!(members.get("secret-link").unwrap().kind, b'2');
+    assert!(members.values().all(|member| member.data != b"secret"));
 }
 
 #[test]
@@ -770,10 +848,19 @@ fn a_cancelled_download_sends_nothing_more() {
         offset: downloads::CHUNK_BYTES as u64,
     });
     peer.cancel(download);
-    // Its slot is free: the connection's whole allowance works again.
+    // Its slot comes back once its thread returns, which it does promptly
+    // (but not necessarily before the next request): the connection's
+    // whole allowance works again.
     let mut started = Vec::new();
-    for _ in 0..downloads::MAX_DOWNLOADS {
-        started.push(peer.begin(&[&path], None).unwrap().0);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while started.len() < downloads::MAX_DOWNLOADS {
+        match peer.begin(&[&path], None) {
+            Ok((download, _)) => started.push(download),
+            Err(error) if error.code == Code::Busy && Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(5));
+            }
+            Err(error) => panic!("{error:?}"),
+        }
     }
     // Over the allowance: busy.
     assert_eq!(peer.begin(&[&path], None).err().unwrap().code, Code::Busy);

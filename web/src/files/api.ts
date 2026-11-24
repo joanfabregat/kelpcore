@@ -25,6 +25,12 @@ export type FileLimits = {
   max_depth: number;
   /** Downloads (`file-downloads`), absent from servers without them. */
   downloads?: DownloadLimits;
+  /** The file root: every path must lie inside it (the server user's home
+   * directory unless the server names another folder). Start browsing
+   * there and offer nothing outside it (`isInside` in `paths.ts`): the
+   * server refuses such paths with `outside_root`. Absent from servers
+   * without the boundary. */
+  root?: string;
 };
 /** Welcome `file_limits.downloads`. */
 export type DownloadLimits = {
@@ -150,6 +156,8 @@ export type FileErrorCode =
   | "no_space"
   | "busy"
   | "io"
+  /** The path, or a symlink on the way, leads outside the file root. */
+  | "outside_root"
   /** Client side: the connection closed or the reply never came. */
   | "closed"
   | "timeout"
@@ -210,6 +218,7 @@ const descriptions: Record<string, string> = {
   no_space: "No space left on the device",
   busy: "The server is busy with other file operations",
   io: "Input/output error",
+  outside_root: "Outside the folders this server lets you browse",
   closed: "The connection is closed",
   timeout: "No reply from the server; the outcome is unknown",
   cancelled: "The download was cancelled",
@@ -240,6 +249,16 @@ export function readFileLimits(value: any): FileLimits | null {
   }
   const downloads = readDownloadLimits(value.downloads);
   if (downloads) limits.downloads = downloads;
+  // An absolute path without NUL, at most `max_path_bytes`; a malformed one
+  // is dropped (the server still enforces its root).
+  const root = value.root;
+  if (
+    typeof root === "string" &&
+    root.startsWith("/") &&
+    !root.includes("\0") &&
+    new TextEncoder().encode(root).length <= limits.max_path_bytes
+  )
+    limits.root = root.length > 1 ? root.replace(/\/+$/, "") : root;
   return limits as FileLimits;
 }
 const downloadKeys = [
