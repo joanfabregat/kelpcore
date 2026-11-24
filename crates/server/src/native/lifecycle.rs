@@ -52,6 +52,9 @@ pub struct Settings {
     pub upload_dir: Option<PathBuf>,
     /// Days completed uploads are kept (`--upload-retention-days`, 0 keeps them).
     pub upload_retention_days: Option<u32>,
+    /// The folder file operations are confined to (`--files-root`; the
+    /// server user's home directory when absent).
+    pub files_root: Option<PathBuf>,
 }
 const MAX_SETTINGS: u64 = 64 * 1024;
 fn settings_bytes(path: &Path) -> Result<Vec<u8>> {
@@ -101,6 +104,12 @@ pub fn persist_upload_settings(path: &Path, uploads: &super::uploads::Settings) 
         return Ok(());
     }
     persist_keys(path, keys)
+}
+/// Record the file root of `kelpserver start --files-root` in
+/// `workspace.json`, keeping every other key. It takes effect when the
+/// server next starts.
+pub fn persist_files_root(path: &Path, root: &Path) -> Result<()> {
+    persist_keys(path, [("files_root", serde_json::to_value(root)?)])
 }
 fn persist_keys<'a>(
     path: &Path,

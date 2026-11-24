@@ -35,6 +35,8 @@ impl Daemon {
             NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         fs::create_dir(&root).unwrap();
+        // Destinations are answered in the canonical spelling.
+        let root = fs::canonicalize(&root).unwrap();
         let state = root.join("state");
         fs::create_dir(&state).unwrap();
         fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
@@ -51,7 +53,11 @@ impl Daemon {
                 dir: Some(uploads),
                 retention_days,
             },
-            files: Default::default(),
+            // Destinations must lie inside the file root: the test's folder.
+            files: kelpserver::native::files::Settings {
+                root: Some(root.clone()),
+                ..Default::default()
+            },
         };
         let handle = thread::spawn(move || serve(config));
         let daemon = Self {
@@ -595,6 +601,37 @@ fn destinations_must_be_existing_owned_absolute_directories() {
     }
     // Nothing was created by the refused requests.
     assert_eq!(fs::read_dir(&base).unwrap().count(), 1);
+}
+
+#[test]
+fn destinations_must_lie_inside_the_file_root() {
+    let daemon = Daemon::start();
+    let mut peer = daemon.peer();
+    // A folder owned by this user outside the root (a sibling of it).
+    let outside = daemon.root.with_extension("outside");
+    let _ = fs::remove_dir_all(&outside);
+    fs::create_dir(&outside).unwrap();
+    let error = peer.begin(&[("a", 1)], Some(&outside)).unwrap_err();
+    assert!(error.contains("outside the file root"), "{error}");
+    // Through a symlink in an intermediate component that leads outside.
+    let link = daemon.root.join("out");
+    std::os::unix::fs::symlink(&outside, &link).unwrap();
+    fs::create_dir(outside.join("sub")).unwrap();
+    assert!(peer.begin(&[("a", 1)], Some(&link.join("sub"))).is_err());
+    assert_eq!(fs::read_dir(&outside).unwrap().count(), 1);
+    // A folder inside, reached through a symlink that stays inside.
+    let inside = daemon.root.join("inside");
+    fs::create_dir(&inside).unwrap();
+    std::os::unix::fs::symlink("inside", daemon.root.join("in")).unwrap();
+    fs::create_dir(inside.join("sub")).unwrap();
+    let (batch, dir) = peer
+        .begin(&[("a.txt", 1)], Some(&daemon.root.join("in/sub")))
+        .unwrap();
+    assert_eq!(dir.parent().unwrap(), daemon.root.join("in/sub"));
+    peer.upload(batch, &[b"a"], 1);
+    peer.finish(batch).unwrap();
+    assert_eq!(fs::read_dir(inside.join("sub")).unwrap().count(), 1);
+    fs::remove_dir_all(&outside).unwrap();
 }
 
 /// A registered batch directory, created the way the server creates them.

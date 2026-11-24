@@ -10,9 +10,11 @@
 //! so a slow client stalls its download rather than filling the server's
 //! memory or output queue. Nothing is built whole in memory or on disk.
 //!
-//! The same care as the other file operations applies: a single file is
-//! opened like `file_read` opens it (the type checked first, never a device
-//! or FIFO); an archive walks its folders through directory descriptors
+//! The same care as the other file operations applies: every selected path
+//! must lie inside the file root and is opened beneath it (`outside_root`
+//! otherwise, the root itself is not downloaded); a single file is opened
+//! like `file_read` opens it (the type checked first, never a device or
+//! FIFO); an archive walks its folders through directory descriptors
 //! opened with `O_NOFOLLOW`, stores symlinks as links without following
 //! them, opens each file with `O_NOFOLLOW`, never enters another file
 //! system (an opened folder must be the listed one, on the walk's device),
@@ -173,10 +175,12 @@ impl Drop for Running {
 }
 
 /// Start a download on its own thread; `threads` counts running download
-/// threads.
+/// threads. `root` is the server's file root (`None` refuses the download
+/// with `outside_root`).
 pub fn start(
     paths: Vec<String>,
     archive: Option<Archive>,
+    root: Option<files::Root>,
     threads: &Arc<AtomicUsize>,
 ) -> io::Result<Job> {
     let (sender, receiver) = mpsc::sync_channel(AHEAD);
@@ -189,7 +193,7 @@ pub fn start(
         .name("kelpserver-download".into())
         .spawn(move || {
             let _running = running;
-            run(paths, archive, Output::new(sender, flag));
+            run(paths, archive, root, Output::new(sender, flag));
         })?;
     Ok(Job {
         receiver,
@@ -273,10 +277,14 @@ impl Write for Output {
     }
 }
 
-fn run(paths: Vec<String>, archive: Option<Archive>, output: Output) {
+fn run(paths: Vec<String>, archive: Option<Archive>, root: Option<files::Root>, output: Output) {
     let sender = output.sender.clone();
     let cancel = output.cancel.clone();
-    let failure = match download(paths, archive, output) {
+    let result = match &root {
+        Some(root) => download(paths, archive, root, output),
+        None => Err(files::no_root()),
+    };
+    let failure = match result {
         Ok(done) => {
             let _ = sender.send(done);
             return;
@@ -287,8 +295,12 @@ fn run(paths: Vec<String>, archive: Option<Archive>, output: Output) {
         let _ = sender.send(Piece::Failed(failure));
     }
 }
-fn download(paths: Vec<String>, archive: Option<Archive>, output: Output) -> Outcome<Piece> {
-    let home = files::home();
+fn download(
+    paths: Vec<String>,
+    archive: Option<Archive>,
+    root: &files::Root,
+    output: Output,
+) -> Outcome<Piece> {
     if paths.is_empty() || paths.len() > files::MAX_PATHS {
         return Err(Error::new(
             Code::InvalidRequest,
@@ -301,22 +313,22 @@ fn download(paths: Vec<String>, archive: Option<Archive>, output: Output) -> Out
             error.path = Some(path.clone());
             error
         };
-        let checked = files::normalize(path, home.as_deref()).map_err(at)?;
-        if checked.file_name().is_none() {
+        let checked = root.request_path(path).map_err(at)?;
+        if root.relative(&checked)?.as_os_str().is_empty() {
             return Err(at(Error::new(
-                Code::InvalidPath,
-                "the root directory has no name",
+                Code::InvalidRequest,
+                "the file root itself is not downloaded; select the entries inside it",
             )));
         }
         normalized.push(checked);
     }
     match archive {
-        None if normalized.len() == 1 => raw(&normalized[0], output),
+        None if normalized.len() == 1 => raw(root, &normalized[0], output),
         None => Err(Error::new(
             Code::InvalidRequest,
             "several paths download only as an archive",
         )),
-        Some(Archive::TarGz) => tar_gz(&normalized, output, BOUNDS),
+        Some(Archive::TarGz) => tar_gz(root, &normalized, output, BOUNDS),
     }
 }
 /// Map an output failure: a cancelled download, or an I/O error at `path`.
@@ -329,29 +341,14 @@ fn output_error(error: io::Error, path: &Path) -> Error {
 }
 
 /// One regular file, as itself.
-fn raw(path: &Path, mut output: Output) -> Outcome<Piece> {
-    let cpath =
-        files::cstring(path.as_os_str().as_bytes()).map_err(|e| files::io_error(e, path))?;
-    // The type first (following a final symlink, as `file_read` does):
-    // opening a device or FIFO can have side effects.
-    let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    files::check(unsafe { libc::fstatat(libc::AT_FDCWD, cpath.as_ptr(), &mut st, 0) })
-        .map_err(|e| files::io_error(e, path))?;
-    if files::is_dir(&st) {
-        return Err(
-            Error::new(Code::IsADirectory, "a folder downloads only as an archive").at(path),
-        );
-    }
-    files::regular(&st, path, "download")?;
-    let fd = files::open_at(
-        libc::AT_FDCWD,
-        &cpath,
-        libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOCTTY,
-        0,
-    )
-    .map_err(|e| files::io_error(e, path))?;
-    let st = files::stat_fd(fd.as_raw_fd()).map_err(|e| files::io_error(e, path))?;
-    files::regular(&st, path, "download")?;
+fn raw(root: &files::Root, path: &Path, mut output: Output) -> Outcome<Piece> {
+    // Opened like `file_read` opens it: beneath the root, the type first.
+    let (fd, st) = files::open_regular(root, path, "download").map_err(|mut error| {
+        if error.code == Code::IsADirectory {
+            error.message = "a folder downloads only as an archive".into();
+        }
+        error
+    })?;
     output
         .send(Piece::Started {
             name: name_text(path),
@@ -555,11 +552,11 @@ fn enter(
     Ok(same_folder(listed, &opened, dev).then_some(child))
 }
 /// The selected entries, checked.
-fn roots(paths: &[PathBuf]) -> Outcome<Vec<Root>> {
+fn roots(root: &files::Root, paths: &[PathBuf]) -> Outcome<Vec<Root>> {
     let mut roots = Vec::with_capacity(paths.len());
     let mut names = std::collections::BTreeSet::new();
     for path in paths {
-        let location = files::locate(path)?;
+        let location = files::locate(root, path)?;
         let st = lstat_at(location.dir.as_raw_fd(), &location.name)
             .map_err(|e| files::io_error(e, path))?;
         if !names.insert(location.name.clone()) {
@@ -652,8 +649,13 @@ fn plan_entry(
 }
 
 /// Files and folders as one gzip-compressed tar archive.
-fn tar_gz(paths: &[PathBuf], mut output: Output, bounds: Bounds) -> Outcome<Piece> {
-    let roots = roots(paths)?;
+fn tar_gz(
+    root: &files::Root,
+    paths: &[PathBuf],
+    mut output: Output,
+    bounds: Bounds,
+) -> Outcome<Piece> {
+    let roots = roots(root, paths)?;
     let plan = plan(&roots, &mut Walk::new(bounds, output.cancel.clone()))?;
     let name = match &roots[..] {
         [root] => format!("{}.tar.gz", name_text(&root.path)),
@@ -1329,7 +1331,8 @@ mod tests {
         }
     }
     fn plan_of(path: &Path, bounds: Bounds, cancelled: bool) -> (Outcome<Plan>, Walk) {
-        let roots = roots(&[path.to_owned()]).unwrap();
+        let root = files::Root::new(path.parent()).unwrap();
+        let roots = roots(&root, &[root.confine(path).unwrap()]).unwrap();
         let mut walk = Walk::new(bounds, Arc::new(AtomicBool::new(cancelled)));
         (plan(&roots, &mut walk), walk)
     }

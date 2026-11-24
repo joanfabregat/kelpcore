@@ -154,6 +154,8 @@ fn file_replies_reach_the_page_when_well_formed() {
             "failed":[{"path":"/home/me/build","error":{"code":"permission_denied","message":"denied","path":"/home/me/build"}}]}}),
         json!({"Stream":{"type":"file_error","request":"file-6","error":{"code":"conflict","message":"the file changed since it was read","path":"/home/me/a.txt","current_hash":hash}}}),
         json!({"Stream":{"type":"file_error","request":"file-7","error":{"code":"too_large","message":"too large","size":99999999}}}),
+        // Codes are open: `outside_root` (the file root) passes like any.
+        json!({"Stream":{"type":"file_error","request":"file-8","error":{"code":"outside_root","message":"the path is outside the file root","path":"/etc/passwd"}}}),
     ] {
         assert!(client.accept(&event).is_ok(), "{event}");
     }

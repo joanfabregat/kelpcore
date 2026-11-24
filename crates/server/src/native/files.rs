@@ -5,18 +5,30 @@
 //!
 //! These operations grant nothing a stream connection does not already have:
 //! any connection may type into a shell running as the server's user. They
-//! run with the server's credentials and never elevate. What they add is
-//! care against surprises, not a confinement:
+//! run with the server's credentials and never elevate. What they add is a
+//! boundary for the file browser and care against surprises:
 //!
-//! - Paths are absolute (or `~`-relative to the server user's `HOME`),
+//! - Paths are absolute (or `~`-relative to the server user's home),
 //!   lexically normalised, and may not contain `..`.
+//! - Every path must lie inside the file root ([`Root`]: the server user's
+//!   home directory unless [`Settings::root`] names another folder), and is
+//!   resolved beneath it: `openat2` with `RESOLVE_BENEATH`, or, where that
+//!   refuses (an absolute symlink) or is missing, a walk that opens one
+//!   component at a time with `O_NOFOLLOW` and resolves each symlink itself
+//!   (at most [`MAX_SYMLINKS`]), refusing one that leads out of the root.
+//!   Anything outside fails with `outside_root`. A symlink pointing outside
+//!   is still listed and stat'ed as a link (its target shown), but nothing
+//!   is read, written, listed or downloaded through it. Mount points inside
+//!   the root stay usable. The root itself can be listed and stat'ed, never
+//!   written, renamed, moved, trashed or deleted.
 //! - Every change (write, mkdir, rename, trash, delete) acts on the final
 //!   component through its parent's directory descriptor and never follows a
 //!   symlink there: writing to a symlink is refused, deleting or trashing one
 //!   removes the link, never its target, and recursive deletion opens every
 //!   directory with `O_NOFOLLOW`. Reads, stats and listings follow symlinks
-//!   in intermediate components like a shell does; `file_stat` and listing
-//!   entries describe a symlink itself (`lstat`) and report its target.
+//!   in intermediate components like a shell does (within the root);
+//!   `file_stat` and listing entries describe a symlink itself (`lstat`) and
+//!   report its target.
 //! - Nothing that is not a regular file is opened for reading or writing:
 //!   the type is checked first, since opening a device or FIFO can have side
 //!   effects.
@@ -25,8 +37,8 @@
 //!   bits and group. A read-only target is refused, like a shell's `>`. A
 //!   `base_hash` turns the write into a compare-and-swap on the content's
 //!   SHA-256, re-checked against the file's metadata just before the rename.
-//! - `/` and the server user's home directory are never removed, and
-//!   recursive deletion never crosses into another file system.
+//! - `/`, the server user's home directory and the file root are never
+//!   removed, and recursive deletion never crosses into another file system.
 //! - Sizes, entry counts, paths per request and concurrent operations are
 //!   bounded ([`LIMITS`], advertised in Welcome `file_limits`).
 //!
@@ -52,6 +64,7 @@ use std::{
         unix::ffi::OsStrExt,
     },
     path::{Component, Path, PathBuf},
+    sync::atomic::{AtomicBool, Ordering},
 };
 
 /// Largest file `file_read` returns. Its base64 form (about 10.7 MiB) fits
@@ -87,9 +100,11 @@ const TEXT_BUDGET: usize = 12 * 1024 * 1024;
 /// Longest file name on Linux file systems.
 const NAME_MAX: usize = 255;
 const TRASHINFO: &str = ".trashinfo";
+/// Most symlinks followed while resolving one path (Linux's own bound).
+pub const MAX_SYMLINKS: usize = 40;
 
-/// File bounds advertised in Welcome `file_limits`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// File bounds advertised in Welcome `file_limits`, with the file root.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Limits {
     pub max_read_bytes: u64,
     pub max_write_bytes: u64,
@@ -102,7 +117,14 @@ pub struct Limits {
     /// Absent from servers without downloads.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub downloads: Option<super::downloads::Limits>,
+    /// The file root: every path of a file operation must lie inside it
+    /// (canonical, without symlinks). Absent from servers without the
+    /// boundary, and from a server that could not resolve its root (every
+    /// file operation then fails with `outside_root`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root: Option<String>,
 }
+/// The constant bounds; the server adds its [`Root`] (`root`).
 pub const LIMITS: Limits = Limits {
     max_read_bytes: MAX_READ_BYTES,
     max_write_bytes: MAX_WRITE_BYTES,
@@ -112,6 +134,7 @@ pub const LIMITS: Limits = Limits {
     max_path_bytes: MAX_PATH_BYTES,
     max_depth: MAX_DEPTH,
     downloads: Some(super::downloads::LIMITS),
+    root: None,
 };
 
 /// Server configuration of file operations.
@@ -121,6 +144,102 @@ pub struct Settings {
     /// freedesktop home trash, `$XDG_DATA_HOME/Trash` or
     /// `~/.local/share/Trash`.
     pub trash_dir: Option<PathBuf>,
+    /// The folder every file operation is confined to (`--files-root`).
+    /// `None` is the server user's home directory (`HOME`, or the password
+    /// database's entry when `HOME` is unset or relative). It is resolved
+    /// once, when the server starts ([`Root::new`]).
+    pub root: Option<PathBuf>,
+}
+
+/// The folder file operations are confined to, resolved when the server
+/// starts: canonical (its own path has no symlink), an existing directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Root {
+    path: PathBuf,
+    /// The configured spelling when it differs from the canonical one (a
+    /// home directory reached through a symlink, say): request paths under
+    /// it name the same entries and are answered in the canonical spelling.
+    alias: Option<PathBuf>,
+    /// The home directory `~` names, canonical when it can be resolved.
+    home: Option<PathBuf>,
+}
+impl Root {
+    /// Resolve `configured`, or the server user's home directory.
+    pub fn new(configured: Option<&Path>) -> std::result::Result<Self, String> {
+        let home = home();
+        let given = match configured {
+            Some(path) => path.to_path_buf(),
+            None => home
+                .clone()
+                .ok_or("the server user has no absolute home directory")?,
+        };
+        if !given.is_absolute() {
+            return Err(format!(
+                "the file root {} is not an absolute path",
+                given.display()
+            ));
+        }
+        let path = std::fs::canonicalize(&given)
+            .map_err(|error| format!("the file root {}: {error}", given.display()))?;
+        if !path.is_dir() {
+            return Err(format!(
+                "the file root {} is not a directory",
+                given.display()
+            ));
+        }
+        let alias = normalize_home(&given).ok().filter(|alias| *alias != path);
+        let home = home.and_then(|home| {
+            std::fs::canonicalize(&home)
+                .ok()
+                .or_else(|| normalize_home(&home).ok())
+        });
+        Ok(Self { path, alias, home })
+    }
+    /// The canonical path of the root.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+    /// The home directory `~` names.
+    pub fn home(&self) -> Option<&Path> {
+        self.home.as_deref()
+    }
+    /// An absolute, normalised path inside the root, spelled from the
+    /// canonical root; `outside_root` otherwise. Purely lexical: symlinks
+    /// are checked when the path is opened ([`open_beneath`]).
+    pub fn confine(&self, path: &Path) -> Outcome<PathBuf> {
+        if path.starts_with(&self.path) {
+            return Ok(path.to_path_buf());
+        }
+        if let Some(rest) = self
+            .alias
+            .as_deref()
+            .and_then(|alias| path.strip_prefix(alias).ok())
+        {
+            return Ok(if rest.as_os_str().is_empty() {
+                self.path.clone()
+            } else {
+                self.path.join(rest)
+            });
+        }
+        Err(outside(path))
+    }
+    /// A request path, normalised (`~` is the home directory) and confined.
+    pub fn request_path(&self, path: &str) -> Outcome<PathBuf> {
+        self.confine(&normalize(path, self.home())?)
+    }
+    /// A confined path relative to the root (empty for the root itself).
+    pub(super) fn relative<'a>(&self, path: &'a Path) -> Outcome<&'a Path> {
+        path.strip_prefix(&self.path).map_err(|_| outside(path))
+    }
+    fn open(&self) -> Outcome<OwnedFd> {
+        let cpath =
+            cstring(self.path.as_os_str().as_bytes()).map_err(|e| io_error(e, &self.path))?;
+        open_at(libc::AT_FDCWD, &cpath, libc::O_PATH | libc::O_DIRECTORY, 0)
+            .map_err(|e| io_error(e, &self.path))
+    }
+}
+fn outside(path: &Path) -> Error {
+    Error::new(Code::OutsideRoot, "the path is outside the file root").at(path)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -190,6 +309,8 @@ pub enum Code {
     Busy,
     /// Any other I/O error; `message` has the system's description.
     Io,
+    /// The path, or a symlink on the way to it, leads outside the file root.
+    OutsideRoot,
 }
 /// A structured failure of a file operation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -257,11 +378,32 @@ pub struct Failure {
     pub error: Error,
 }
 
-/// The server user's home directory, from `HOME`.
+/// The server user's home directory: `HOME`, or the password database's
+/// entry for the effective user when `HOME` is unset or not absolute.
 pub fn home() -> Option<PathBuf> {
     std::env::var_os("HOME")
         .map(PathBuf::from)
         .filter(|path| path.is_absolute())
+        .or_else(passwd_home)
+}
+fn passwd_home() -> Option<PathBuf> {
+    let mut buffer = vec![0u8; 16 * 1024];
+    let mut entry: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut found: *mut libc::passwd = std::ptr::null_mut();
+    let status = unsafe {
+        libc::getpwuid_r(
+            libc::geteuid(),
+            &mut entry,
+            buffer.as_mut_ptr().cast(),
+            buffer.len(),
+            &mut found,
+        )
+    };
+    if status != 0 || found.is_null() || entry.pw_dir.is_null() {
+        return None;
+    }
+    let dir = unsafe { CStr::from_ptr(entry.pw_dir) };
+    Some(PathBuf::from(OsStr::from_bytes(dir.to_bytes()))).filter(|path| path.is_absolute())
 }
 /// Lexically normalise a request path: `~` and `~/…` start at `home`;
 /// otherwise it must be absolute. Empty and `.` components are dropped; `..`,
@@ -515,22 +657,243 @@ fn random_hex() -> io::Result<String> {
     Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
 }
 
-/// The parent directory of a normalised path, opened (following symlinks in
-/// the parent's own path, like a shell), and the final name.
+/// `RESOLVE_*` flags of `openat2` (`linux/openat2.h`), and its `open_how`,
+/// written out so that any `libc` 0.2 builds.
+const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
+const RESOLVE_BENEATH: u64 = 0x08;
+#[repr(C)]
+struct OpenHow {
+    flags: u64,
+    mode: u64,
+    resolve: u64,
+}
+/// Set once `openat2` is known to be missing (Linux before 5.6, or a
+/// seccomp filter answering `ENOSYS`).
+static NO_OPENAT2: AtomicBool = AtomicBool::new(false);
+fn openat2_beneath(dir: RawFd, path: &CStr, flags: libc::c_int) -> io::Result<OwnedFd> {
+    let how = OpenHow {
+        flags: (flags | libc::O_CLOEXEC) as u64,
+        mode: 0,
+        resolve: RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS,
+    };
+    let fd = unsafe {
+        libc::syscall(
+            libc::SYS_openat2,
+            dir,
+            path.as_ptr(),
+            &how as *const OpenHow,
+            std::mem::size_of::<OpenHow>(),
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { OwnedFd::from_raw_fd(fd as RawFd) })
+}
+/// Open `rel` (relative to the root, as [`Root::relative`] returns it)
+/// beneath the root with `flags`, following symlinks only where they stay
+/// inside it; `follow` decides for the final component (`O_NOFOLLOW`
+/// otherwise). `path` is the absolute path, for errors.
+///
+/// `openat2` with `RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS` resolves it in
+/// the kernel. It refuses an absolute symlink even when the link points
+/// inside the root, and some systems lack it; then [`walk`] decides.
+pub(super) fn open_beneath(
+    root: &Root,
+    rel: &Path,
+    flags: libc::c_int,
+    follow: bool,
+    path: &Path,
+) -> Outcome<OwnedFd> {
+    let base = root.open()?;
+    let flags = if follow {
+        flags
+    } else {
+        flags | libc::O_NOFOLLOW
+    };
+    if !NO_OPENAT2.load(Ordering::Relaxed) {
+        let name = if rel.as_os_str().is_empty() {
+            c".".to_owned()
+        } else {
+            cstring(rel.as_os_str().as_bytes()).map_err(|e| io_error(e, path))?
+        };
+        // `EAGAIN`: a rename elsewhere raced the lookup; the kernel asks
+        // for a retry.
+        for _ in 0..4 {
+            match openat2_beneath(base.as_raw_fd(), &name, flags) {
+                Ok(fd) => return Ok(fd),
+                Err(error) => match error.raw_os_error() {
+                    Some(libc::EAGAIN) => continue,
+                    Some(libc::ENOSYS) => {
+                        NO_OPENAT2.store(true, Ordering::Relaxed);
+                        break;
+                    }
+                    // Out of the root, or an absolute symlink.
+                    Some(libc::EXDEV) => break,
+                    _ => return Err(io_error(error, path)),
+                },
+            }
+        }
+    }
+    walk(root, &base, rel, flags, path)
+}
+/// Push the components of `bytes` so that the first is popped first.
+fn push_components(pending: &mut Vec<Vec<u8>>, bytes: &[u8]) {
+    for part in bytes.rsplit(|&b| b == b'/') {
+        if !part.is_empty() {
+            pending.push(part.to_vec());
+        }
+    }
+}
+/// Resolve `rel` beneath the root one component at a time: every
+/// directory is opened with `O_NOFOLLOW` relative to the one before, so the
+/// kernel never follows a symlink; each symlink met is read and its target
+/// resolved here, an absolute one only when it names a path inside the
+/// root, and `..` returns to the directory it came from, never above the
+/// root. A symlink that leads outside fails with `outside_root`.
+fn walk(
+    root: &Root,
+    base: &OwnedFd,
+    rel: &Path,
+    flags: libc::c_int,
+    path: &Path,
+) -> Outcome<OwnedFd> {
+    let fail = |error: io::Error| io_error(error, path);
+    let follow = flags & libc::O_NOFOLLOW == 0;
+    // The directories entered below the root, innermost last.
+    let mut stack: Vec<OwnedFd> = Vec::new();
+    let mut pending = Vec::new();
+    push_components(&mut pending, rel.as_os_str().as_bytes());
+    let mut links = 0;
+    let link = |links: &mut usize| {
+        *links += 1;
+        if *links > MAX_SYMLINKS {
+            return Err(fail(io::Error::from_raw_os_error(libc::ELOOP)));
+        }
+        Ok(())
+    };
+    while let Some(name) = pending.pop() {
+        let dir = stack.last().unwrap_or(base).as_raw_fd();
+        match name.as_slice() {
+            b"." => continue,
+            b".." => {
+                if stack.pop().is_none() {
+                    return Err(outside(path));
+                }
+                continue;
+            }
+            _ => {}
+        }
+        let last = pending.is_empty();
+        let cname = cstring(&name).map_err(fail)?;
+        if last && !follow {
+            return open_at(dir, &cname, flags, 0).map_err(fail);
+        }
+        let st = stat_at(dir, &cname).map_err(fail)?;
+        if is_symlink(&st) {
+            link(&mut links)?;
+            let target = read_link_bytes(dir, &cname).map_err(fail)?;
+            if target.first() == Some(&b'/') {
+                let inside = root
+                    .confine(Path::new(OsStr::from_bytes(&target)))
+                    .map_err(|_| outside(path))?;
+                let rest = root.relative(&inside)?;
+                stack.clear();
+                push_components(&mut pending, rest.as_os_str().as_bytes());
+            } else {
+                push_components(&mut pending, &target);
+            }
+            continue;
+        }
+        let child_flags = if last {
+            flags | libc::O_NOFOLLOW
+        } else {
+            libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW
+        };
+        match open_at(dir, &cname, child_flags, 0) {
+            Ok(fd) if last => return Ok(fd),
+            Ok(fd) => stack.push(fd),
+            // Replaced by a symlink since it was examined: examine it again.
+            Err(error)
+                if matches!(error.raw_os_error(), Some(libc::ELOOP | libc::ENOTDIR))
+                    && stat_at(dir, &cname).is_ok_and(|st| is_symlink(&st)) =>
+            {
+                link(&mut links)?;
+                pending.push(name);
+            }
+            Err(error) => return Err(fail(error)),
+        }
+    }
+    // The root itself, or a directory reached through `..`.
+    let dir = stack.last().unwrap_or(base).as_raw_fd();
+    open_at(dir, c".", flags, 0).map_err(fail)
+}
+/// A symlink's target as bytes, not followed.
+fn read_link_bytes(dir: RawFd, name: &CStr) -> io::Result<Vec<u8>> {
+    let mut buffer = vec![0u8; MAX_PATH_BYTES + 1];
+    let length =
+        unsafe { libc::readlinkat(dir, name.as_ptr(), buffer.as_mut_ptr().cast(), buffer.len()) };
+    if length < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if length as usize > MAX_PATH_BYTES {
+        return Err(io::Error::from_raw_os_error(libc::ENAMETOOLONG));
+    }
+    buffer.truncate(length as usize);
+    Ok(buffer)
+}
+
+/// The parent directory of a confined path, opened beneath the root
+/// (following symlinks in the parent's own path that stay inside it, like a
+/// shell), and the final name. The root itself has none.
 pub(super) struct Location {
     pub(super) dir: OwnedFd,
     pub(super) name: CString,
 }
-pub(super) fn locate(path: &Path) -> Outcome<Location> {
-    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
-        return Err(Error::new(Code::InvalidPath, "the root directory has no name").at(path));
+pub(super) fn locate(root: &Root, path: &Path) -> Outcome<Location> {
+    let rel = root.relative(path)?;
+    let Some(name) = rel.file_name() else {
+        return Err(Error::new(
+            Code::InvalidRequest,
+            "this operation does not apply to the file root itself",
+        )
+        .at(path));
     };
-    let parent_c = cstring(parent.as_os_str().as_bytes()).map_err(|e| io_error(e, path))?;
-    let dir = open_at(libc::AT_FDCWD, &parent_c, DIRECTORY, 0).map_err(|e| io_error(e, path))?;
+    let parent = rel.parent().unwrap_or(Path::new(""));
+    let dir = open_beneath(root, parent, DIRECTORY, true, path)?;
     Ok(Location {
         dir,
         name: cstring(name.as_bytes()).map_err(|e| io_error(e, path))?,
     })
+}
+/// Open a confined path beneath the root (see [`open_beneath`]).
+pub(super) fn open_path(
+    root: &Root,
+    path: &Path,
+    flags: libc::c_int,
+    follow: bool,
+) -> Outcome<OwnedFd> {
+    open_beneath(root, root.relative(path)?, flags, follow, path)
+}
+/// Open a regular file for reading, following a final symlink within the
+/// root. The type comes first, from an `O_PATH` descriptor: opening a
+/// device or FIFO can have side effects, such as releasing a FIFO's writer
+/// or arming a watchdog. `O_NONBLOCK` and `O_NOCTTY` limit the effect of an
+/// entry swapped for one in between, which the second check refuses.
+pub(super) fn open_regular(root: &Root, path: &Path, verb: &str) -> Outcome<(OwnedFd, libc::stat)> {
+    let probe = open_path(root, path, libc::O_PATH, true)?;
+    let st = stat_fd(probe.as_raw_fd()).map_err(|e| io_error(e, path))?;
+    regular(&st, path, verb)?;
+    drop(probe);
+    let fd = open_path(
+        root,
+        path,
+        libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOCTTY,
+        true,
+    )?;
+    let st = stat_fd(fd.as_raw_fd()).map_err(|e| io_error(e, path))?;
+    regular(&st, path, verb)?;
+    Ok((fd, st))
 }
 /// Rename without replacing an existing target. A file system without
 /// `RENAME_NOREPLACE` gets a check, then a plain rename.
@@ -610,9 +973,8 @@ fn hash_file(file: &mut File, limit: u64) -> io::Result<Option<String>> {
     Ok(Some(hasher.hex()))
 }
 
-fn list(path: &Path) -> Outcome<(Vec<Entry>, bool, usize)> {
-    let cpath = cstring(path.as_os_str().as_bytes()).map_err(|e| io_error(e, path))?;
-    let dir = open_at(libc::AT_FDCWD, &cpath, DIRECTORY, 0).map_err(|e| io_error(e, path))?;
+fn list(root: &Root, path: &Path) -> Outcome<(Vec<Entry>, bool, usize)> {
+    let dir = open_path(root, path, DIRECTORY, true)?;
     let (found, mut truncated, skipped) = select(dir.as_raw_fd()).map_err(|e| io_error(e, path))?;
     let mut entries = Vec::with_capacity(found.len());
     for name in found {
@@ -645,14 +1007,20 @@ fn list(path: &Path) -> Outcome<(Vec<Entry>, bool, usize)> {
     Ok((entries, truncated, skipped))
 }
 
-fn stat(path: &Path) -> Outcome<Entry> {
-    let cpath = cstring(path.as_os_str().as_bytes()).map_err(|e| io_error(e, path))?;
-    let st = stat_at(libc::AT_FDCWD, &cpath).map_err(|e| io_error(e, path))?;
+fn stat(root: &Root, path: &Path) -> Outcome<Entry> {
     let name = path.file_name().map_or_else(
         || "/".to_owned(),
         |name| name.to_string_lossy().into_owned(),
     );
-    Ok(entry(name, &st, libc::AT_FDCWD, &cpath))
+    if root.relative(path)?.as_os_str().is_empty() {
+        // The root itself: canonical, so never a symlink.
+        let fd = root.open()?;
+        let st = stat_fd(fd.as_raw_fd()).map_err(|e| io_error(e, path))?;
+        return Ok(entry(name, &st, fd.as_raw_fd(), c"."));
+    }
+    let location = locate(root, path)?;
+    let st = stat_at(location.dir.as_raw_fd(), &location.name).map_err(|e| io_error(e, path))?;
+    Ok(entry(name, &st, location.dir.as_raw_fd(), &location.name))
 }
 
 struct Content {
@@ -664,27 +1032,9 @@ struct Content {
     encoding: Encoding,
     content: String,
 }
-fn read(path: &Path, max_bytes: Option<u64>) -> Outcome<Content> {
+fn read(root: &Root, path: &Path, max_bytes: Option<u64>) -> Outcome<Content> {
     let limit = max_bytes.unwrap_or(MAX_READ_BYTES).min(MAX_READ_BYTES);
-    let cpath = cstring(path.as_os_str().as_bytes()).map_err(|e| io_error(e, path))?;
-    // The type first (following a final symlink, as the read does): opening
-    // a device or FIFO can have side effects, such as releasing a FIFO's
-    // writer or arming a watchdog.
-    let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    check(unsafe { libc::fstatat(libc::AT_FDCWD, cpath.as_ptr(), &mut st, 0) })
-        .map_err(|e| io_error(e, path))?;
-    regular(&st, path, "read")?;
-    // O_NONBLOCK and O_NOCTTY limit the effect of an entry swapped for a
-    // FIFO or terminal in between, which the check below then refuses.
-    let fd = open_at(
-        libc::AT_FDCWD,
-        &cpath,
-        libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOCTTY,
-        0,
-    )
-    .map_err(|e| io_error(e, path))?;
-    let st = stat_fd(fd.as_raw_fd()).map_err(|e| io_error(e, path))?;
-    regular(&st, path, "read")?;
+    let (fd, st) = open_regular(root, path, "read")?;
     let too_large = |size: u64| {
         let mut error = Error::new(
             Code::TooLarge,
@@ -748,7 +1098,13 @@ fn decode(content: String, encoding: Encoding) -> Outcome<Vec<u8>> {
     }
     Ok(bytes)
 }
-fn write(path: &Path, bytes: &[u8], base_hash: Option<&str>, create: bool) -> Outcome<Written> {
+fn write(
+    root: &Root,
+    path: &Path,
+    bytes: &[u8],
+    base_hash: Option<&str>,
+    create: bool,
+) -> Outcome<Written> {
     if create && base_hash.is_some() {
         return Err(Error::new(
             Code::InvalidRequest,
@@ -756,7 +1112,7 @@ fn write(path: &Path, bytes: &[u8], base_hash: Option<&str>, create: bool) -> Ou
         ));
     }
     let fail = |e: io::Error| io_error(e, path);
-    let location = locate(path)?;
+    let location = locate(root, path)?;
     let dir = location.dir.as_raw_fd();
     let name = &location.name;
     let symlink = || Error::new(Code::Symlink, "refusing to write through a symlink").at(path);
@@ -897,17 +1253,17 @@ fn write(path: &Path, bytes: &[u8], base_hash: Option<&str>, create: bool) -> Ou
     result
 }
 
-fn mkdir(path: &Path) -> Outcome<()> {
-    let location = locate(path)?;
+fn mkdir(root: &Root, path: &Path) -> Outcome<()> {
+    let location = locate(root, path)?;
     check(unsafe { libc::mkdirat(location.dir.as_raw_fd(), location.name.as_ptr(), 0o777) })
         .map_err(|e| io_error(e, path))?;
     sync_dir(location.dir.as_raw_fd());
     Ok(())
 }
 
-fn rename(from: &Path, to: &Path, overwrite: bool) -> Outcome<()> {
-    let source = locate(from)?;
-    let target = locate(to)?;
+fn rename(root: &Root, from: &Path, to: &Path, overwrite: bool) -> Outcome<()> {
+    let source = locate(root, from)?;
+    let target = locate(root, to)?;
     // The source must exist (a symlink is moved as a link).
     stat_at(source.dir.as_raw_fd(), &source.name).map_err(|e| io_error(e, from))?;
     let result = if overwrite {
@@ -1013,11 +1369,15 @@ fn remove_entry(
         Err(error) => Err(io_error(error, path)),
     }
 }
-/// Refuse to remove `/` or the server user's home directory itself, under
-/// whatever path names it (`st` is the entry's `lstat`, so a symlink to
-/// either is not protected: removing it removes only the link).
-fn protect(st: &libc::stat, home: Option<&Path>, path: &Path) -> Outcome<()> {
-    for protected in [Some(Path::new("/")), home].into_iter().flatten() {
+/// Refuse to remove `/`, the server user's home directory or the file root
+/// itself, under whatever path names it (a bind mount, say; `st` is the
+/// entry's `lstat`, so a symlink to one is not protected: removing it
+/// removes only the link).
+fn protect(st: &libc::stat, root: &Root, path: &Path) -> Outcome<()> {
+    for protected in [Some(Path::new("/")), root.home(), Some(root.path())]
+        .into_iter()
+        .flatten()
+    {
         let Ok(name) = cstring(protected.as_os_str().as_bytes()) else {
             continue;
         };
@@ -1028,18 +1388,18 @@ fn protect(st: &libc::stat, home: Option<&Path>, path: &Path) -> Outcome<()> {
         {
             return Err(Error::new(
                 Code::InvalidRequest,
-                "refusing to remove the root or home directory",
+                "refusing to remove /, the home directory or the file root",
             )
             .at(path));
         }
     }
     Ok(())
 }
-fn delete(path: &Path, home: Option<&Path>) -> Outcome<()> {
-    let location = locate(path)?;
+fn delete(root: &Root, path: &Path) -> Outcome<()> {
+    let location = locate(root, path)?;
     let dir = location.dir.as_raw_fd();
     let st = stat_at(dir, &location.name).map_err(|e| io_error(e, path))?;
-    protect(&st, home, path)?;
+    protect(&st, root, path)?;
     remove_entry(dir, &location.name, &st, 0, st.st_dev, path)?;
     sync_dir(dir);
     Ok(())
@@ -1169,11 +1529,11 @@ fn open_trash(settings: &Settings) -> Outcome<Trash> {
 /// with `O_EXCL`, write and sync it, then rename the entry to
 /// `files/<name>` without replacing anything. A failed move removes the
 /// info file again.
-fn trash_one(trash: &Trash, path: &Path, home: Option<&Path>) -> Outcome<PathBuf> {
-    let location = locate(path)?;
+fn trash_one(trash: &Trash, root: &Root, path: &Path) -> Outcome<PathBuf> {
+    let location = locate(root, path)?;
     let dir = location.dir.as_raw_fd();
     let entry = stat_at(dir, &location.name).map_err(|e| io_error(e, path))?;
-    protect(&entry, home, path)?;
+    protect(&entry, root, path)?;
     let st = stat_fd(dir).map_err(|e| io_error(e, path))?;
     if st.st_dev != trash.dev {
         return Err(Error::new(
@@ -1244,7 +1604,7 @@ pub fn failure(request: String, error: Error) -> Event {
 fn removal(
     request: String,
     paths: &[String],
-    home: Option<&Path>,
+    root: &Root,
     mut remove: impl FnMut(&Path) -> Outcome<Option<PathBuf>>,
 ) -> Event {
     if paths.is_empty() || paths.len() > MAX_PATHS {
@@ -1253,9 +1613,11 @@ fn removal(
             Error::new(Code::InvalidRequest, format!("name 1 to {MAX_PATHS} paths")),
         );
     }
+    // Every path is checked before anything is removed: one outside the
+    // root refuses the whole request.
     let mut normalized = Vec::with_capacity(paths.len());
     for path in paths {
-        match normalize(path, home) {
+        match root.request_path(path) {
             Ok(path) => normalized.push(path),
             Err(mut error) => {
                 error.path = Some(path.clone());
@@ -1285,11 +1647,14 @@ fn removal(
 }
 /// Run one file request (blocking; called on a worker thread). Every outcome
 /// is a reply event for the requester whose serialized form fits one record.
-pub fn execute(request: Request, settings: &Settings) -> Event {
-    let home = home();
-    let home = home.as_deref();
+/// `root` is the server's file root; `None` (it could not be resolved)
+/// refuses every operation with `outside_root`.
+pub fn execute(request: Request, settings: &Settings, root: Option<&Root>) -> Event {
     let correlation = request.correlation().unwrap_or_default().to_owned();
-    let event = match run(request, settings, home) {
+    let Some(root) = root else {
+        return failure(correlation, no_root());
+    };
+    let event = match run(request, settings, root) {
         Ok(event) => event,
         Err(error) => failure(correlation.clone(), error),
     };
@@ -1302,7 +1667,14 @@ pub fn execute(request: Request, settings: &Settings) -> Event {
     }
     event
 }
-fn run(request: Request, settings: &Settings, home: Option<&Path>) -> Outcome<Event> {
+/// The refusal of a server whose file root could not be resolved.
+pub fn no_root() -> Error {
+    Error::new(
+        Code::OutsideRoot,
+        "the server has no file root (it could not be resolved at startup)",
+    )
+}
+fn run(request: Request, settings: &Settings, root: &Root) -> Outcome<Event> {
     fn at(path: &str) -> impl FnOnce(Error) -> Error + '_ {
         move |mut error| {
             error.path = Some(path.to_owned());
@@ -1311,8 +1683,8 @@ fn run(request: Request, settings: &Settings, home: Option<&Path>) -> Outcome<Ev
     }
     Ok(match request {
         Request::FileList { request, path } => {
-            let path = normalize(&path, home).map_err(at(&path))?;
-            let (entries, truncated, skipped) = list(&path)?;
+            let path = root.request_path(&path).map_err(at(&path))?;
+            let (entries, truncated, skipped) = list(root, &path)?;
             Event::FileList {
                 request,
                 path: path_text(&path),
@@ -1322,8 +1694,8 @@ fn run(request: Request, settings: &Settings, home: Option<&Path>) -> Outcome<Ev
             }
         }
         Request::FileStat { request, path } => {
-            let path = normalize(&path, home).map_err(at(&path))?;
-            let entry = stat(&path)?;
+            let path = root.request_path(&path).map_err(at(&path))?;
+            let entry = stat(root, &path)?;
             Event::FileStat {
                 request,
                 path: path_text(&path),
@@ -1335,8 +1707,8 @@ fn run(request: Request, settings: &Settings, home: Option<&Path>) -> Outcome<Ev
             path,
             max_bytes,
         } => {
-            let path = normalize(&path, home).map_err(at(&path))?;
-            let content = read(&path, max_bytes)?;
+            let path = root.request_path(&path).map_err(at(&path))?;
+            let content = read(root, &path, max_bytes)?;
             Event::FileContent {
                 request,
                 path: path_text(&path),
@@ -1357,9 +1729,9 @@ fn run(request: Request, settings: &Settings, home: Option<&Path>) -> Outcome<Ev
             base_hash,
             create,
         } => {
-            let path = normalize(&path, home).map_err(at(&path))?;
+            let path = root.request_path(&path).map_err(at(&path))?;
             let bytes = decode(content, encoding).map_err(|e| e.at(&path))?;
-            let written = write(&path, &bytes, base_hash.as_deref(), create)?;
+            let written = write(root, &path, &bytes, base_hash.as_deref(), create)?;
             Event::FileWritten {
                 request,
                 path: path_text(&path),
@@ -1370,8 +1742,8 @@ fn run(request: Request, settings: &Settings, home: Option<&Path>) -> Outcome<Ev
             }
         }
         Request::FileMkdir { request, path } => {
-            let path = normalize(&path, home).map_err(at(&path))?;
-            mkdir(&path)?;
+            let path = root.request_path(&path).map_err(at(&path))?;
+            mkdir(root, &path)?;
             Event::Done { request }
         }
         Request::FileRename {
@@ -1380,9 +1752,9 @@ fn run(request: Request, settings: &Settings, home: Option<&Path>) -> Outcome<Ev
             to,
             overwrite,
         } => {
-            let from = normalize(&from, home).map_err(at(&from))?;
-            let to = normalize(&to, home).map_err(at(&to))?;
-            rename(&from, &to, overwrite)?;
+            let from = root.request_path(&from).map_err(at(&from))?;
+            let to = root.request_path(&to).map_err(at(&to))?;
+            rename(root, &from, &to, overwrite)?;
             Event::Done { request }
         }
         Request::FileTrash { request, paths } => {
@@ -1390,12 +1762,12 @@ fn run(request: Request, settings: &Settings, home: Option<&Path>) -> Outcome<Ev
                 Ok(trash) => trash,
                 Err(error) => return Ok(failure(request, error)),
             };
-            removal(request, &paths, home, |path| {
-                trash_one(&trash, path, home).map(Some)
+            removal(request, &paths, root, |path| {
+                trash_one(&trash, root, path).map(Some)
             })
         }
-        Request::FileDelete { request, paths } => removal(request, &paths, home, |path| {
-            delete(path, home).map(|()| None)
+        Request::FileDelete { request, paths } => removal(request, &paths, root, |path| {
+            delete(root, path).map(|()| None)
         }),
         _ => {
             return Err(Error::new(Code::InvalidRequest, "not a file operation"));
@@ -1484,36 +1856,233 @@ mod tests {
         let (binary, encoding, _) = content(controls.into_bytes());
         assert_eq!((binary, encoding), (false, Encoding::Base64));
     }
+    /// A fresh folder for a test, canonical, and a root over it.
+    fn scratch(test: &str) -> (PathBuf, Root) {
+        let path = std::env::temp_dir().join(format!(
+            "kelpserver-files-unit-{}-{test}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).unwrap();
+        let path = std::fs::canonicalize(&path).unwrap();
+        let root = Root::new(Some(&path)).unwrap();
+        assert_eq!(root.path(), path);
+        (path, root)
+    }
     #[test]
-    fn the_home_directory_is_never_removed() {
-        let root =
-            std::env::temp_dir().join(format!("kelpserver-files-unit-{}", std::process::id()));
-        let home = root.join("home");
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(home.join("notes")).unwrap();
-        std::fs::write(home.join("notes/a.txt"), "a").unwrap();
-        std::os::unix::fs::symlink(&home, root.join("link")).unwrap();
-        let error = delete(&home, Some(&home)).unwrap_err();
+    fn the_file_root_is_never_removed() {
+        let (base, root) = scratch("protect");
+        let trash_dir = base.with_extension("trash");
+        std::fs::create_dir_all(base.join("notes")).unwrap();
+        std::fs::write(base.join("notes/a.txt"), "a").unwrap();
+        std::os::unix::fs::symlink(&base, base.join("link")).unwrap();
+        let error = delete(&root, &base).unwrap_err();
         assert_eq!(error.code, Code::InvalidRequest);
         let trash = open_trash(&Settings {
-            trash_dir: Some(root.join("Trash")),
+            trash_dir: Some(trash_dir.clone()),
+            root: None,
         })
         .unwrap();
-        let error = trash_one(&trash, &home, Some(&home)).unwrap_err();
+        let error = trash_one(&trash, &root, &base).unwrap_err();
         assert_eq!(error.code, Code::InvalidRequest);
-        assert!(home.join("notes/a.txt").exists());
-        // A symlink to the home directory is only a link.
-        delete(&root.join("link"), Some(&home)).unwrap();
-        assert!(home.join("notes/a.txt").exists());
+        assert!(base.join("notes/a.txt").exists());
+        // A symlink to the root is only a link.
+        delete(&root, &base.join("link")).unwrap();
+        assert!(base.join("notes/a.txt").exists());
         // Below it, everything can be removed.
-        delete(&home.join("notes"), Some(&home)).unwrap();
-        assert!(!home.join("notes").exists());
-        // `/` has no name to remove.
+        delete(&root, &base.join("notes")).unwrap();
+        assert!(!base.join("notes").exists());
+        // `/` is outside.
         assert_eq!(
-            delete(Path::new("/"), Some(&home)).unwrap_err().code,
+            delete(&root, Path::new("/")).unwrap_err().code,
+            Code::OutsideRoot
+        );
+        std::fs::remove_dir_all(&base).unwrap();
+        std::fs::remove_dir_all(&trash_dir).unwrap();
+    }
+    #[test]
+    fn request_paths_are_confined_lexically() {
+        let (base, root) = scratch("confine");
+        let ok = |path: &str| root.request_path(path).unwrap();
+        let text = base.to_str().unwrap();
+        assert_eq!(ok(text), base);
+        assert_eq!(ok(&format!("{text}//a/./b/")), base.join("a/b"));
+        for bad in [
+            "/",
+            "/etc/passwd",
+            &format!("{text}x"),
+            &format!("{text}x/a"),
+        ] {
+            assert_eq!(
+                root.request_path(bad).unwrap_err().code,
+                Code::OutsideRoot,
+                "{bad:?}"
+            );
+        }
+        // `..` stays an invalid path, before any confinement.
+        assert_eq!(
+            root.request_path(&format!("{text}/a/../.."))
+                .unwrap_err()
+                .code,
             Code::InvalidPath
         );
-        std::fs::remove_dir_all(&root).unwrap();
+        // A root reached through a symlink: its spelling is an alias,
+        // answered in the canonical spelling.
+        let alias = base.with_extension("alias");
+        let _ = std::fs::remove_file(&alias);
+        std::os::unix::fs::symlink(&base, &alias).unwrap();
+        let aliased = Root::new(Some(&alias)).unwrap();
+        assert_eq!(aliased.path(), base);
+        assert_eq!(aliased.confine(&alias.join("x")).unwrap(), base.join("x"));
+        assert_eq!(aliased.confine(&alias).unwrap(), base);
+        assert_eq!(aliased.confine(&base.join("y")).unwrap(), base.join("y"));
+        std::fs::remove_file(&alias).unwrap();
+        // A root must be an existing absolute directory.
+        assert!(Root::new(Some(Path::new("relative"))).is_err());
+        assert!(Root::new(Some(&base.join("missing"))).is_err());
+        std::fs::write(base.join("file"), "").unwrap();
+        assert!(Root::new(Some(&base.join("file"))).is_err());
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+    #[test]
+    fn the_walk_resolves_symlinks_beneath_the_root() {
+        use std::os::unix::fs::symlink;
+        let (base, root) = scratch("walk");
+        std::fs::create_dir_all(base.join("a/b")).unwrap();
+        std::fs::write(base.join("a/b/f.txt"), "inside").unwrap();
+        symlink("a/b", base.join("rel")).unwrap();
+        symlink(base.join("a"), base.join("abs")).unwrap();
+        symlink("../b/f.txt", base.join("a/b/up")).unwrap();
+        symlink("..", base.join("parent")).unwrap();
+        symlink("/etc", base.join("etc")).unwrap();
+        symlink("../../..", base.join("a/b/escape")).unwrap();
+        symlink("loop2", base.join("loop1")).unwrap();
+        symlink("loop1", base.join("loop2")).unwrap();
+        let read = |rel: &str| -> Outcome<String> {
+            let base_fd = root.open()?;
+            let path = base.join(rel);
+            let fd = walk(&root, &base_fd, Path::new(rel), libc::O_RDONLY, &path)?;
+            let mut text = String::new();
+            File::from(fd).read_to_string(&mut text).unwrap();
+            Ok(text)
+        };
+        for inside in ["a/b/f.txt", "rel/f.txt", "abs/b/f.txt", "a/b/up", "rel/up"] {
+            assert_eq!(read(inside).unwrap(), "inside", "{inside}");
+        }
+        for outside in [
+            "parent/x",
+            "etc/passwd",
+            "etc",
+            "a/b/escape",
+            "abs/b/escape/x",
+        ] {
+            assert_eq!(
+                read(outside).unwrap_err().code,
+                Code::OutsideRoot,
+                "{outside}"
+            );
+        }
+        assert_eq!(read("loop1").unwrap_err().code, Code::Symlink);
+        // The root itself, and a final symlink not followed.
+        let base_fd = root.open().unwrap();
+        let fd = walk(&root, &base_fd, Path::new(""), DIRECTORY, &base).unwrap();
+        assert!(is_dir(&stat_fd(fd.as_raw_fd()).unwrap()));
+        let fd = walk(
+            &root,
+            &base_fd,
+            Path::new("etc"),
+            libc::O_PATH | libc::O_NOFOLLOW,
+            &base.join("etc"),
+        )
+        .unwrap();
+        assert!(is_symlink(&stat_fd(fd.as_raw_fd()).unwrap()));
+        // `open_beneath` agrees, through `openat2` where it can.
+        let open = |rel: &str| open_beneath(&root, Path::new(rel), libc::O_RDONLY, true, &base);
+        assert!(open("abs/b/f.txt").is_ok());
+        assert!(open("rel/up").is_ok());
+        assert_eq!(open("etc/passwd").unwrap_err().code, Code::OutsideRoot);
+        assert_eq!(open("parent/x").unwrap_err().code, Code::OutsideRoot);
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+    #[test]
+    fn a_symlink_swapped_while_resolving_never_escapes() {
+        use std::os::unix::fs::symlink;
+        use std::sync::Arc;
+        let (base, root) = scratch("race");
+        let outside = base.with_extension("outside");
+        let _ = std::fs::remove_dir_all(&outside);
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("f.txt"), "outside").unwrap();
+        std::fs::create_dir(base.join("in")).unwrap();
+        std::fs::write(base.join("in/f.txt"), "inside").unwrap();
+        symlink("in", base.join("swap")).unwrap();
+        // Another thread keeps replacing `swap` (atomically, by rename)
+        // with a link inside and a link outside.
+        let stop = Arc::new(AtomicBool::new(false));
+        let swapper = {
+            let (base, outside, stop) = (base.clone(), outside.clone(), stop.clone());
+            std::thread::spawn(move || {
+                let mut n = 0u64;
+                while !stop.load(Ordering::Relaxed) {
+                    let next = base.join(".swap-next");
+                    let _ = std::fs::remove_file(&next);
+                    if n % 2 == 0 {
+                        symlink(&outside, &next).unwrap();
+                    } else {
+                        symlink("in", &next).unwrap();
+                    }
+                    std::fs::rename(&next, base.join("swap")).unwrap();
+                    n += 1;
+                }
+                n
+            })
+        };
+        let path = base.join("swap/f.txt");
+        let (mut inside, mut refused) = (0, 0);
+        for attempt in 0..4000 {
+            // Through `openat2` and through the walk alone.
+            let result = if attempt % 2 == 0 {
+                read(&root, &path, None).map(|content| content.content)
+            } else {
+                root.open()
+                    .and_then(|base_fd| {
+                        walk(
+                            &root,
+                            &base_fd,
+                            Path::new("swap/f.txt"),
+                            libc::O_RDONLY,
+                            &path,
+                        )
+                    })
+                    .map(|fd| {
+                        let mut text = String::new();
+                        File::from(fd).read_to_string(&mut text).unwrap();
+                        text
+                    })
+            };
+            match result {
+                Ok(text) => {
+                    assert_eq!(text, "inside");
+                    inside += 1;
+                }
+                Err(error) => {
+                    assert!(
+                        matches!(
+                            error.code,
+                            Code::OutsideRoot | Code::NotFound | Code::NotADirectory
+                        ),
+                        "{error:?}"
+                    );
+                    refused += 1;
+                }
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        let swaps = swapper.join().unwrap();
+        assert_eq!(inside + refused, 4000);
+        assert!(swaps > 0);
+        std::fs::remove_dir_all(&base).unwrap();
+        std::fs::remove_dir_all(&outside).unwrap();
     }
     #[test]
     fn versions_compare_inode_size_and_times() {
@@ -1544,6 +2113,7 @@ mod tests {
             "is_a_directory"
         );
         assert_eq!(name(serde_json::json!(Code::CrossDevice)), "cross_device");
+        assert_eq!(name(serde_json::json!(Code::OutsideRoot)), "outside_root");
         assert_eq!(name(serde_json::json!(Encoding::Utf8)), "utf8");
         assert_eq!(name(serde_json::json!(Kind::Symlink)), "symlink");
         let request: Request = serde_json::from_str(
