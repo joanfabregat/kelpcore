@@ -191,6 +191,11 @@ pub(super) struct Tree {
     /// home directory reached through a symlink, say): request paths under
     /// it name the same entries and are answered in the canonical spelling.
     alias: Option<PathBuf>,
+    /// The directory's device and inode at startup. Every later open of
+    /// the folder must find the same directory ([`Tree::open`]), so that
+    /// replacing it or a parent (with a symlink, say) never redirects file
+    /// operations elsewhere.
+    id: (libc::dev_t, libc::ino_t),
 }
 impl Tree {
     /// Resolve the configured folder `given` (`what` names it in errors).
@@ -203,11 +208,25 @@ impl Tree {
         }
         let path = std::fs::canonicalize(given)
             .map_err(|error| format!("the {what} {}: {error}", given.display()))?;
-        if !path.is_dir() {
+        // The canonical path's last component is no symlink: opened without
+        // following one, it is the directory recorded below.
+        let fd = cstring(path.as_os_str().as_bytes())
+            .and_then(|cpath| open_at(libc::AT_FDCWD, &cpath, libc::O_PATH | libc::O_NOFOLLOW, 0))
+            .and_then(|fd| stat_fd(fd.as_raw_fd()))
+            .map_err(|error| format!("the {what} {}: {error}", given.display()))?;
+        if !is_dir(&fd) {
             return Err(format!("the {what} {} is not a directory", given.display()));
         }
         let alias = normalize_home(given).ok().filter(|alias| *alias != path);
-        Ok(Self { path, alias })
+        Ok(Self {
+            path,
+            alias,
+            id: (fd.st_dev, fd.st_ino),
+        })
+    }
+    /// Whether `st` describes this folder (as recorded at startup).
+    fn is(&self, st: &libc::stat) -> bool {
+        (st.st_dev, st.st_ino) == self.id
     }
     /// The canonical path of the folder.
     pub(super) fn path(&self) -> &Path {
@@ -246,11 +265,24 @@ impl Tree {
     fn relative<'a>(&self, path: &'a Path) -> Outcome<&'a Path> {
         path.strip_prefix(&self.path).map_err(|_| outside(path))
     }
+    /// Open the folder (`O_PATH`), refusing anything but the directory
+    /// recorded at startup: a root replaced since, or reached through a
+    /// parent that was, fails with `outside_root` until the server
+    /// restarts.
     fn open(&self) -> Outcome<OwnedFd> {
         let cpath =
             cstring(self.path.as_os_str().as_bytes()).map_err(|e| io_error(e, &self.path))?;
-        open_at(libc::AT_FDCWD, &cpath, libc::O_PATH | libc::O_DIRECTORY, 0)
-            .map_err(|e| io_error(e, &self.path))
+        let fd = open_at(libc::AT_FDCWD, &cpath, libc::O_PATH | libc::O_NOFOLLOW, 0)
+            .map_err(|e| io_error(e, &self.path))?;
+        let st = stat_fd(fd.as_raw_fd()).map_err(|e| io_error(e, &self.path))?;
+        if !self.is(&st) {
+            return Err(Error::new(
+                Code::OutsideRoot,
+                "the file root is no longer the folder the server started with",
+            )
+            .at(&self.path));
+        }
+        Ok(fd)
     }
 }
 
@@ -1470,8 +1502,17 @@ fn rename(root: &Root, from: &Path, to: &Path, overwrite: bool) -> Outcome<()> {
     }
     let source = locate(root, from)?;
     let target = locate(root, to)?;
-    // The source must exist (a symlink is moved as a link).
-    stat_at(source.dir.as_raw_fd(), &source.name).map_err(|e| io_error(e, from))?;
+    // The source must exist (a symlink is moved as a link), and be neither
+    // `/`, the home directory nor a root under another name (a bind
+    // mount); nor may an overwritten target be one.
+    let st = stat_at(source.dir.as_raw_fd(), &source.name).map_err(|e| io_error(e, from))?;
+    protect(&st, root, from)?;
+    let replaced = overwrite
+        .then(|| stat_at(target.dir.as_raw_fd(), &target.name).ok())
+        .flatten();
+    if let Some(st) = replaced {
+        protect(&st, root, to)?;
+    }
     let result = if overwrite {
         check(unsafe {
             libc::renameat(
@@ -1578,13 +1619,20 @@ fn remove_entry(
 /// Refuse to remove `/`, the server user's home directory or a file root
 /// itself, under whatever path names it (a bind mount, say; `st` is the
 /// entry's `lstat`, so a symlink to one is not protected: removing it
-/// removes only the link).
+/// removes only the link). The roots are matched by the device and inode
+/// recorded at startup, not by looking their paths up again.
 fn protect(st: &libc::stat, root: &Root, path: &Path) -> Outcome<()> {
-    for protected in [Path::new("/")]
-        .into_iter()
-        .chain(root.home())
-        .chain(root.paths())
-    {
+    let refuse = || {
+        Err(Error::new(
+            Code::InvalidRequest,
+            "refusing to remove or move /, the home directory or a file root",
+        )
+        .at(path))
+    };
+    if root.trees.iter().any(|tree| tree.is(st)) {
+        return refuse();
+    }
+    for protected in [Path::new("/")].into_iter().chain(root.home()) {
         let Ok(name) = cstring(protected.as_os_str().as_bytes()) else {
             continue;
         };
@@ -1593,11 +1641,7 @@ fn protect(st: &libc::stat, root: &Root, path: &Path) -> Outcome<()> {
         if unsafe { libc::fstatat(libc::AT_FDCWD, name.as_ptr(), &mut other, 0) } == 0
             && (other.st_dev, other.st_ino) == (st.st_dev, st.st_ino)
         {
-            return Err(Error::new(
-                Code::InvalidRequest,
-                "refusing to remove /, the home directory or a file root",
-            )
-            .at(path));
+            return refuse();
         }
     }
     Ok(())
@@ -1681,6 +1725,9 @@ struct Trash {
     files: OwnedFd,
     info: OwnedFd,
     dev: libc::dev_t,
+    /// The canonical path of `files/`, when it can be learnt: it decides
+    /// which root's entries may be trashed ([`trash_allowed`]).
+    place: Option<PathBuf>,
 }
 fn private_dir_at(parent: RawFd, name: &CStr, path: &Path) -> Outcome<OwnedFd> {
     if unsafe { libc::mkdirat(parent, name.as_ptr(), 0o700) } != 0 {
@@ -1725,12 +1772,43 @@ fn open_trash(settings: &Settings) -> Outcome<Trash> {
     let dev = stat_fd(files.as_raw_fd())
         .map_err(|e| io_error(e, &root))?
         .st_dev;
+    // Where the opened `files/` directory really is, symlinks resolved.
+    let place = std::fs::read_link(format!("/proc/self/fd/{}", files.as_raw_fd()))
+        .ok()
+        .filter(|path| path.is_absolute())
+        .or_else(|| std::fs::canonicalize(root.join("files")).ok());
     Ok(Trash {
         root,
         files,
         info,
         dev,
+        place,
     })
+}
+/// Refuse to trash `path` when that would move it into another file root:
+/// an entry may go to a trash inside its own root, and an entry of the
+/// primary root also to a trash outside every root (server configuration,
+/// as before extra roots). A trash whose place is unknown takes nothing.
+fn trash_allowed(trash: &Trash, root: &Root, path: &Path) -> Outcome<()> {
+    let tree = root.tree(path)?;
+    let allowed = trash.place.as_deref().is_some_and(|place| {
+        match root
+            .trees
+            .iter()
+            .find(|other| place.starts_with(&other.path))
+        {
+            Some(holder) => holder.path == tree.path,
+            None => tree.path == root.trees[0].path,
+        }
+    });
+    if allowed {
+        return Ok(());
+    }
+    Err(Error::new(
+        Code::CrossRoot,
+        "the trash is outside this file root; delete the entry instead",
+    )
+    .at(path))
 }
 /// Move one entry to the trash: reserve a unique `info/<name>.trashinfo`
 /// with `O_EXCL`, write and sync it, then rename the entry to
@@ -1741,6 +1819,7 @@ fn trash_one(trash: &Trash, root: &Root, path: &Path) -> Outcome<PathBuf> {
     let dir = location.dir.as_raw_fd();
     let entry = stat_at(dir, &location.name).map_err(|e| io_error(e, path))?;
     protect(&entry, root, path)?;
+    trash_allowed(trash, root, path)?;
     let st = stat_fd(dir).map_err(|e| io_error(e, path))?;
     if st.st_dev != trash.dev {
         return Err(Error::new(
@@ -2289,6 +2368,92 @@ mod tests {
         );
         rename(&root, &extra.join("d"), &extra.join("e"), false).unwrap();
         assert!(primary.join("a").exists() && extra.join("e").is_dir());
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+    #[test]
+    fn the_trash_never_moves_an_entry_into_another_root() {
+        let (base, _) = scratch("trash-extras");
+        for dir in ["primary/d", "extra/d", "elsewhere"] {
+            std::fs::create_dir_all(base.join(dir)).unwrap();
+        }
+        let (primary, extra) = (base.join("primary"), base.join("extra"));
+        let (root, _) = Root::with_extras(Some(&primary), std::slice::from_ref(&extra)).unwrap();
+        let trash_in = |dir: PathBuf| {
+            open_trash(&Settings {
+                trash_dir: Some(dir),
+                ..Default::default()
+            })
+            .unwrap()
+        };
+        let reset = || {
+            std::fs::write(primary.join("d/a"), "a").unwrap();
+            std::fs::write(extra.join("d/b"), "b").unwrap();
+        };
+        // A trash inside the primary root, on the extra root's file system:
+        // an entry of the extra root stays where it is.
+        reset();
+        let trash = trash_in(primary.join(".local/share/Trash"));
+        let error = trash_one(&trash, &root, &extra.join("d/b")).unwrap_err();
+        assert_eq!(error.code, Code::CrossRoot);
+        assert!(extra.join("d/b").exists());
+        trash_one(&trash, &root, &primary.join("d/a")).unwrap();
+        // A trash inside the extra root takes only the extra root's entries.
+        reset();
+        let trash = trash_in(extra.join(".Trash"));
+        trash_one(&trash, &root, &extra.join("d/b")).unwrap();
+        let error = trash_one(&trash, &root, &primary.join("d/a")).unwrap_err();
+        assert_eq!(error.code, Code::CrossRoot);
+        assert!(primary.join("d/a").exists());
+        // A trash outside every root (server configuration) takes the
+        // primary root's entries, as before extra roots.
+        reset();
+        let trash = trash_in(base.join("elsewhere/Trash"));
+        trash_one(&trash, &root, &primary.join("d/a")).unwrap();
+        let error = trash_one(&trash, &root, &extra.join("d/b")).unwrap_err();
+        assert_eq!(error.code, Code::CrossRoot);
+        assert!(extra.join("d/b").exists());
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+    #[test]
+    fn a_root_replaced_after_startup_is_refused() {
+        use std::os::unix::fs::symlink;
+        let (base, _) = scratch("swapped");
+        for dir in ["primary", "data/extra", "secret"] {
+            std::fs::create_dir_all(base.join(dir)).unwrap();
+        }
+        std::fs::write(base.join("data/extra/f.txt"), "extra").unwrap();
+        std::fs::write(base.join("secret/key"), "secret").unwrap();
+        let (primary, extra) = (base.join("primary"), base.join("data/extra"));
+        let (root, _) = Root::with_extras(Some(&primary), std::slice::from_ref(&extra)).unwrap();
+        assert_eq!(list(&root, &extra).unwrap().0.len(), 1);
+        // Someone able to change the extra root's parent swaps the root for
+        // a symlink to another folder; the server refuses that root.
+        std::fs::rename(&extra, base.join("data/moved")).unwrap();
+        symlink(base.join("secret"), &extra).unwrap();
+        assert_eq!(list(&root, &extra).unwrap_err().code, Code::OutsideRoot);
+        assert_eq!(
+            read(&root, &extra.join("key"), None).err().unwrap().code,
+            Code::OutsideRoot
+        );
+        assert_eq!(stat(&root, &extra).unwrap_err().code, Code::OutsideRoot);
+        assert_eq!(
+            write(&root, &extra.join("new"), b"x", None, true)
+                .err()
+                .unwrap()
+                .code,
+            Code::OutsideRoot
+        );
+        assert_eq!(std::fs::read_dir(base.join("secret")).unwrap().count(), 1);
+        // A parent swapped for a symlink to a copy is refused the same way.
+        std::fs::remove_file(&extra).unwrap();
+        std::fs::rename(base.join("data"), base.join("data-old")).unwrap();
+        std::fs::create_dir_all(base.join("copy/extra")).unwrap();
+        symlink(base.join("copy"), base.join("data")).unwrap();
+        assert_eq!(list(&root, &extra).unwrap_err().code, Code::OutsideRoot);
+        // The primary root is held to its recorded identity too.
+        std::fs::rename(&primary, base.join("primary-old")).unwrap();
+        std::fs::create_dir(&primary).unwrap();
+        assert_eq!(list(&root, &primary).unwrap_err().code, Code::OutsideRoot);
         std::fs::remove_dir_all(&base).unwrap();
     }
     #[test]

@@ -1486,7 +1486,13 @@ fn every_operation_works_inside_an_extra_root() {
     assert_eq!(path, text(&extra.join("sub")));
     peer.write(&work.join("inner/c.txt"), "c", None, true)
         .unwrap();
+    // The trash (outside every root here) takes entries of the primary root
+    // only: trashing would move this one out of its root.
     let (removed, failed) = peer.remove(true, &[&extra.join("d/b.txt")]);
+    assert!(removed.is_empty());
+    assert_eq!(failed, [(text(&extra.join("d/b.txt")), Code::CrossRoot)]);
+    assert!(extra.join("d/b.txt").exists());
+    let (removed, failed) = peer.remove(true, &[&work.join("inner/c.txt")]);
     assert_eq!((removed.len(), failed.len()), (1, 0));
     let (removed, failed) = peer.remove(false, &[&extra.join("d")]);
     assert_eq!((removed.len(), failed.len()), (1, 0));
