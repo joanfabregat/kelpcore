@@ -41,6 +41,9 @@ impl Daemon {
         fs::create_dir(&state).unwrap();
         fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
         let uploads = root.join("uploads");
+        let extra = root.with_extension("extra");
+        let _ = fs::remove_dir_all(&extra);
+        fs::create_dir(&extra).unwrap();
         prepare(&state, &uploads);
         let config = ServerConfig {
             socket: root.join("control.sock"),
@@ -53,9 +56,11 @@ impl Daemon {
                 dir: Some(uploads),
                 retention_days,
             },
-            // Destinations must lie inside the file root: the test's folder.
+            // Destinations must lie inside a file root: the test's folder,
+            // or its sibling `<folder>.extra`, an extra root.
             files: kelpserver::native::files::Settings {
                 root: Some(root.clone()),
+                extra_roots: vec![extra],
                 ..Default::default()
             },
         };
@@ -70,6 +75,10 @@ impl Daemon {
             thread::sleep(Duration::from_millis(10));
         }
         daemon
+    }
+    /// The extra file root, beside the test's folder.
+    fn extra(&self) -> PathBuf {
+        self.root.with_extension("extra")
     }
     fn uploads(&self) -> PathBuf {
         self.root.join("uploads")
@@ -154,6 +163,7 @@ impl Drop for Daemon {
             assert!(t.join().unwrap().is_ok());
         }
         let _ = fs::remove_dir_all(&self.root);
+        let _ = fs::remove_dir_all(self.extra());
     }
 }
 
@@ -632,6 +642,36 @@ fn destinations_must_lie_inside_the_file_root() {
     peer.finish(batch).unwrap();
     assert_eq!(fs::read_dir(inside.join("sub")).unwrap().count(), 1);
     fs::remove_dir_all(&outside).unwrap();
+}
+
+#[test]
+fn destinations_may_lie_inside_an_extra_root() {
+    let daemon = Daemon::start();
+    let mut peer = daemon.peer();
+    let extra = daemon.extra();
+    fs::create_dir(extra.join("drop")).unwrap();
+    let (batch, dir) = peer
+        .begin(&[("a.txt", 1)], Some(&extra.join("drop")))
+        .unwrap();
+    assert_eq!(dir.parent().unwrap(), extra.join("drop"));
+    peer.upload(batch, &[b"a"], 1);
+    peer.finish(batch).unwrap();
+    assert_eq!(fs::read_dir(extra.join("drop")).unwrap().count(), 1);
+    // A symlink in the extra root never leads into the primary root.
+    fs::create_dir(daemon.root.join("target")).unwrap();
+    std::os::unix::fs::symlink(daemon.root.join("target"), extra.join("to-root")).unwrap();
+    let name = daemon.root.file_name().unwrap().to_str().unwrap();
+    std::os::unix::fs::symlink(format!("../{name}"), extra.join("up")).unwrap();
+    fs::create_dir(daemon.root.join("target/sub")).unwrap();
+    for dest in [extra.join("to-root/sub"), extra.join("up/target/sub")] {
+        assert!(peer.begin(&[("a", 1)], Some(&dest)).is_err(), "{dest:?}");
+    }
+    assert_eq!(
+        fs::read_dir(daemon.root.join("target/sub"))
+            .unwrap()
+            .count(),
+        0
+    );
 }
 
 /// A registered batch directory, created the way the server creates them.

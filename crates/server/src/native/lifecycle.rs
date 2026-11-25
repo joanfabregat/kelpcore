@@ -55,6 +55,9 @@ pub struct Settings {
     /// The folder file operations are confined to (`--files-root`; the
     /// server user's home directory when absent).
     pub files_root: Option<PathBuf>,
+    /// Further folders outside the file root that file operations may
+    /// reach (`--files-extra-root`, repeatable).
+    pub files_extra_roots: Option<Vec<PathBuf>>,
 }
 const MAX_SETTINGS: u64 = 64 * 1024;
 fn settings_bytes(path: &Path) -> Result<Vec<u8>> {
@@ -110,6 +113,12 @@ pub fn persist_upload_settings(path: &Path, uploads: &super::uploads::Settings) 
 /// server next starts.
 pub fn persist_files_root(path: &Path, root: &Path) -> Result<()> {
     persist_keys(path, [("files_root", serde_json::to_value(root)?)])
+}
+/// Record the extra file roots of `kelpserver start --files-extra-root` in
+/// `workspace.json`, replacing the previous list and keeping every other
+/// key. They take effect when the server next starts.
+pub fn persist_files_extra_roots(path: &Path, roots: &[PathBuf]) -> Result<()> {
+    persist_keys(path, [("files_extra_roots", serde_json::to_value(roots)?)])
 }
 fn persist_keys<'a>(
     path: &Path,

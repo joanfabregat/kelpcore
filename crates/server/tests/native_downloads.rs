@@ -40,6 +40,7 @@ impl Daemon {
         fs::create_dir(&state).unwrap();
         fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
         fs::create_dir(root.join("work")).unwrap();
+        fs::create_dir(root.join("extra")).unwrap();
         let config = ServerConfig {
             socket: root.join("control.sock"),
             state_dir: state,
@@ -48,10 +49,12 @@ impl Daemon {
             cols: 80,
             rows: 24,
             uploads: Default::default(),
-            // The file root is the test's working folder.
+            // The file root is the test's working folder, with `extra` as
+            // an extra root.
             files: files::Settings {
                 trash_dir: Some(root.join("data/Trash")),
                 root: Some(root.join("work")),
+                extra_roots: vec![root.join("extra")],
             },
         };
         let handle = thread::spawn(move || serve(config));
@@ -68,6 +71,9 @@ impl Daemon {
     }
     fn work(&self) -> PathBuf {
         self.root.join("work")
+    }
+    fn extra(&self) -> PathBuf {
+        self.root.join("extra")
     }
     fn peer(&self) -> Peer {
         let socket = UnixStream::connect(self.root.join("control.sock")).unwrap();
@@ -1012,5 +1018,62 @@ fn a_large_download_streams_while_screens_keep_updating() {
     assert!(
         screens >= 3,
         "{screens} screen updates during a {elapsed:?} download"
+    );
+}
+
+#[test]
+fn downloads_reach_extra_roots_without_crossing_between_roots() {
+    let daemon = Daemon::start();
+    let mut peer = daemon.peer();
+    let (work, extra) = (daemon.work(), daemon.extra());
+    fs::write(work.join("secret.txt"), "primary").unwrap();
+    fs::create_dir(extra.join("project")).unwrap();
+    fs::write(extra.join("project/a.txt"), "a").unwrap();
+    symlink(&work, extra.join("project/to-work")).unwrap();
+    symlink("../work", extra.join("rel-work")).unwrap();
+    symlink(&extra, work.join("to-extra")).unwrap();
+    // A file and a folder inside the extra root download as usual.
+    let got = peer
+        .download(&[&extra.join("project/a.txt")], None)
+        .unwrap();
+    assert_eq!(
+        (got.name.as_str(), got.bytes.as_slice()),
+        ("a.txt", &b"a"[..])
+    );
+    // A selection across two roots is still one archive.
+    let got = peer
+        .download(
+            &[&extra.join("project"), &work.join("secret.txt")],
+            Some(Archive::TarGz),
+        )
+        .unwrap();
+    let members: BTreeMap<String, Member> = untar(&got.bytes)
+        .into_iter()
+        .map(|(name, member)| (String::from_utf8(name).unwrap(), member))
+        .collect();
+    assert_eq!(members.get("project/a.txt").unwrap().data, b"a");
+    // The link into the primary root is stored as a link.
+    assert_eq!(members.get("project/to-work").unwrap().kind, b'2');
+    // Nothing is reached through a link from one root into another.
+    for archive in [None, Some(Archive::TarGz)] {
+        for path in [
+            extra.join("project/to-work/secret.txt"),
+            extra.join("rel-work/secret.txt"),
+            work.join("to-extra/project/a.txt"),
+        ] {
+            assert_eq!(
+                peer.download(&[&path], archive).err().unwrap().code,
+                Code::OutsideRoot,
+                "{path:?}"
+            );
+        }
+    }
+    // An extra root itself is not downloaded.
+    assert_eq!(
+        peer.download(&[&extra], Some(Archive::TarGz))
+            .err()
+            .unwrap()
+            .code,
+        Code::InvalidRequest
     );
 }
