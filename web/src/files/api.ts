@@ -25,12 +25,24 @@ export type FileLimits = {
   max_depth: number;
   /** Downloads (`file-downloads`), absent from servers without them. */
   downloads?: DownloadLimits;
-  /** The file root: every path must lie inside it (the server user's home
-   * directory unless the server names another folder). Start browsing
-   * there and offer nothing outside it (`isInside` in `paths.ts`): the
-   * server refuses such paths with `outside_root`. Absent from servers
-   * without the boundary. */
+  /** The primary file root: every path must lie inside it or inside an
+   * extra root (`roots`); the server user's home directory unless the
+   * server names another folder. Start browsing there and offer nothing
+   * outside the roots (`isInside` in `paths.ts`): the server refuses such
+   * paths with `outside_root`. Absent from servers without the boundary. */
   root?: string;
+  /** Every file root with a label, the primary root first, then the extra
+   * roots (folders outside it, such as a data drive). A move between two
+   * roots is refused (`cross_root`). Absent from servers without extra
+   * roots; then `root` alone applies. */
+  roots?: FileRoot[];
+};
+/** One of Welcome `file_limits.roots`. */
+export type FileRoot = {
+  /** Canonical absolute path. */
+  path: string;
+  /** A short name: `Home`, the folder's name, or its full path. */
+  label: string;
 };
 /** Welcome `file_limits.downloads`. */
 export type DownloadLimits = {
@@ -158,6 +170,8 @@ export type FileErrorCode =
   | "io"
   /** The path, or a symlink on the way, leads outside the file root. */
   | "outside_root"
+  /** A rename whose two ends lie in different file roots. */
+  | "cross_root"
   /** Client side: the connection closed or the reply never came. */
   | "closed"
   | "timeout"
@@ -219,6 +233,7 @@ const descriptions: Record<string, string> = {
   busy: "The server is busy with other file operations",
   io: "Input/output error",
   outside_root: "Outside the folders this server lets you browse",
+  cross_root: "Entries cannot move between these folders",
   closed: "The connection is closed",
   timeout: "No reply from the server; the outcome is unknown",
   cancelled: "The download was cancelled",
@@ -250,16 +265,40 @@ export function readFileLimits(value: any): FileLimits | null {
   const downloads = readDownloadLimits(value.downloads);
   if (downloads) limits.downloads = downloads;
   // An absolute path without NUL, at most `max_path_bytes`; a malformed one
-  // is dropped (the server still enforces its root).
-  const root = value.root;
-  if (
-    typeof root === "string" &&
-    root.startsWith("/") &&
-    !root.includes("\0") &&
-    new TextEncoder().encode(root).length <= limits.max_path_bytes
-  )
-    limits.root = root.length > 1 ? root.replace(/\/+$/, "") : root;
+  // is dropped (the server still enforces its roots).
+  const root = readRootPath(value.root, limits.max_path_bytes);
+  if (root) limits.root = root;
+  // Only with `root`, which must come first; malformed entries are dropped.
+  if (root && Array.isArray(value.roots)) {
+    const roots: FileRoot[] = [];
+    for (const item of value.roots.slice(0, MAX_ROOTS)) {
+      const path = readRootPath(item?.path, limits.max_path_bytes);
+      const label = item?.label;
+      if (
+        path &&
+        typeof label === "string" &&
+        label.length > 0 &&
+        label.length <= limits.max_path_bytes &&
+        !roots.some((other) => other.path === path)
+      )
+        roots.push({ path, label });
+    }
+    if (roots[0]?.path === root) limits.roots = roots;
+  }
   return limits as FileLimits;
+}
+/** Most roots read from `file_limits.roots` (the server's bound of extra
+ * roots, plus the primary one). */
+const MAX_ROOTS = 65;
+function readRootPath(path: any, maxBytes: number): string | undefined {
+  if (
+    typeof path !== "string" ||
+    !path.startsWith("/") ||
+    path.includes("\0") ||
+    new TextEncoder().encode(path).length > maxBytes
+  )
+    return undefined;
+  return path.length > 1 ? path.replace(/\/+$/, "") : path;
 }
 const downloadKeys = [
   "chunk_bytes",

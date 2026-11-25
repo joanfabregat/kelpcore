@@ -29,6 +29,11 @@ impl Daemon {
     /// A server whose file root is `root(test folder)` (`None`: the home
     /// directory, the default).
     fn start_with(files_root: impl FnOnce(&Path) -> Option<PathBuf>) -> Self {
+        Self::start_roots(|root| (files_root(root), Vec::new()))
+    }
+    /// A server whose file root and extra roots are `roots(test folder)`;
+    /// `roots` may also create folders in the test folder first.
+    fn start_roots(roots: impl FnOnce(&Path) -> (Option<PathBuf>, Vec<PathBuf>)) -> Self {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let root = std::env::temp_dir().join(format!(
             "kelpserver-files-{}-{}",
@@ -42,6 +47,7 @@ impl Daemon {
         fs::create_dir(&state).unwrap();
         fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
         fs::create_dir(root.join("work")).unwrap();
+        let (files_root, extra_roots) = roots(&root);
         let config = ServerConfig {
             socket: root.join("control.sock"),
             state_dir: state,
@@ -52,7 +58,8 @@ impl Daemon {
             uploads: Default::default(),
             files: files::Settings {
                 trash_dir: Some(root.join("data/Trash")),
-                root: files_root(&root),
+                root: files_root,
+                extra_roots,
             },
         };
         let handle = thread::spawn(move || serve(config));
@@ -340,6 +347,10 @@ fn files_capability_and_limits_are_advertised() {
                 limits,
                 files::Limits {
                     root: Some(text(&daemon.root)),
+                    roots: Some(vec![files::NamedRoot {
+                        path: text(&daemon.root),
+                        label: text(Path::new(daemon.root.file_name().unwrap())),
+                    }]),
                     ..files::LIMITS
                 }
             );
@@ -976,7 +987,16 @@ fn home_relative_and_invalid_paths() {
     let mut peer = daemon.peer();
     match peer.welcome.clone().unwrap() {
         Event::Welcome { file_limits, .. } => {
-            assert_eq!(file_limits.unwrap().root, Some(text(&home)));
+            let limits = file_limits.unwrap();
+            assert_eq!(limits.root, Some(text(&home)));
+            // The home directory is labelled as such.
+            assert_eq!(
+                limits.roots,
+                Some(vec![files::NamedRoot {
+                    path: text(&home),
+                    label: "Home".into(),
+                }])
+            );
         }
         other => panic!("{other:?}"),
     }
@@ -1382,4 +1402,214 @@ fn symlinks_out_of_the_root_are_listed_but_never_followed() {
     let (removed, _) = peer.remove(false, &[&work.join("rel-out")]);
     assert_eq!(removed.len(), 1);
     assert!(outside.join("secret.txt").exists());
+}
+
+/// A server confined to `work`, with the extra roots `extra`, `a/data` and
+/// `b/data` (same name), and configured extra roots that are skipped: one
+/// missing, a file, one inside `work`, one inside `extra`, a repeat of
+/// `extra` spelled through a symlink, and the test folder (which contains
+/// `work`). `outside` holds `secret.txt`.
+fn with_extras() -> (Daemon, PathBuf, PathBuf, PathBuf) {
+    let daemon = Daemon::start_roots(|root| {
+        for dir in ["extra/sub", "a/data", "b/data", "work/inner", "outside"] {
+            fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        fs::write(root.join("outside/secret.txt"), "secret").unwrap();
+        fs::write(root.join("a-file"), "x").unwrap();
+        symlink(root.join("extra"), root.join("extra-link")).unwrap();
+        (
+            Some(root.join("work")),
+            vec![
+                root.join("extra"),
+                root.join("missing"),
+                root.join("a-file"),
+                root.join("work/inner"),
+                root.join("extra/sub"),
+                root.join("extra-link"),
+                root.to_path_buf(),
+                root.join("a/data"),
+                root.join("b/data"),
+            ],
+        )
+    });
+    let (work, extra, outside) = (
+        daemon.work(),
+        daemon.root.join("extra"),
+        daemon.root.join("outside"),
+    );
+    (daemon, work, extra, outside)
+}
+
+#[test]
+fn extra_roots_are_advertised_without_skipped_ones() {
+    let (daemon, work, extra, _) = with_extras();
+    let peer = daemon.peer();
+    let Event::Welcome { file_limits, .. } = peer.welcome.clone().unwrap() else {
+        unreachable!()
+    };
+    let limits = file_limits.unwrap();
+    // `root` stays the primary root, for older clients.
+    assert_eq!(limits.root, Some(text(&work)));
+    let named = |path: &Path, label: &str| files::NamedRoot {
+        path: text(path),
+        label: label.into(),
+    };
+    let (a, b) = (daemon.root.join("a/data"), daemon.root.join("b/data"));
+    assert_eq!(
+        limits.roots.unwrap(),
+        [
+            named(&work, "work"),
+            named(&extra, "extra"),
+            // The same name twice: each is labelled with its path.
+            named(&a, &text(&a)),
+            named(&b, &text(&b)),
+        ]
+    );
+}
+
+#[test]
+fn every_operation_works_inside_an_extra_root() {
+    let (daemon, work, extra, outside) = with_extras();
+    let mut peer = daemon.peer();
+    // In the extra root, as in the primary one.
+    peer.write(&extra.join("a.txt"), "a", None, true).unwrap();
+    assert_eq!(peer.read(&extra.join("a.txt"), None).unwrap().2, b"a");
+    peer.mkdir(&extra.join("d")).unwrap();
+    peer.rename(&extra.join("a.txt"), &extra.join("d/b.txt"), false)
+        .unwrap();
+    let (entries, _) = peer.list(&extra.join("d"));
+    assert_eq!(entries.len(), 1);
+    let (path, entry) = peer.stat(&text(&extra)).unwrap();
+    assert_eq!((path, entry.kind), (text(&extra), Kind::Dir));
+    // A skipped root's folder is reached only where another root holds it.
+    let (path, _) = peer.stat(&text(&extra.join("sub"))).unwrap();
+    assert_eq!(path, text(&extra.join("sub")));
+    peer.write(&work.join("inner/c.txt"), "c", None, true)
+        .unwrap();
+    // The trash (outside every root here) takes entries of the primary root
+    // only: trashing would move this one out of its root.
+    let (removed, failed) = peer.remove(true, &[&extra.join("d/b.txt")]);
+    assert!(removed.is_empty());
+    assert_eq!(failed, [(text(&extra.join("d/b.txt")), Code::CrossRoot)]);
+    assert!(extra.join("d/b.txt").exists());
+    let (removed, failed) = peer.remove(true, &[&work.join("inner/c.txt")]);
+    assert_eq!((removed.len(), failed.len()), (1, 0));
+    let (removed, failed) = peer.remove(false, &[&extra.join("d")]);
+    assert_eq!((removed.len(), failed.len()), (1, 0));
+    assert!(!extra.join("d").exists());
+    // Outside every root, and the skipped test folder, nothing.
+    for path in [
+        outside.join("secret.txt"),
+        daemon.root.clone(),
+        daemon.root.join("a-file"),
+        daemon.root.join("missing"),
+    ] {
+        assert_eq!(
+            peer.stat(&text(&path)).unwrap_err().code,
+            Code::OutsideRoot,
+            "{path:?}"
+        );
+    }
+    // An extra root itself is browsed, never changed.
+    for trash in [true, false] {
+        let (removed, failed) = peer.remove(trash, &[&extra]);
+        assert!(removed.is_empty());
+        assert_eq!(failed, [(text(&extra), Code::InvalidRequest)]);
+    }
+    assert_eq!(
+        peer.rename(&extra, &extra.join("moved"), false)
+            .unwrap_err()
+            .code,
+        Code::InvalidRequest
+    );
+    assert!(extra.is_dir());
+}
+
+#[test]
+fn renames_between_roots_are_refused() {
+    let (daemon, work, extra, _) = with_extras();
+    let mut peer = daemon.peer();
+    fs::write(work.join("a.txt"), "a").unwrap();
+    fs::write(extra.join("b.txt"), "b").unwrap();
+    for (from, to) in [
+        (work.join("a.txt"), extra.join("a.txt")),
+        (extra.join("b.txt"), work.join("b.txt")),
+        (extra.join("b.txt"), daemon.root.join("a/data/b.txt")),
+    ] {
+        for overwrite in [false, true] {
+            let error = peer.rename(&from, &to, overwrite).unwrap_err();
+            assert_eq!(error.code, Code::CrossRoot, "{from:?} -> {to:?}");
+            assert_eq!(error.path.as_deref(), Some(text(&to).as_str()));
+        }
+    }
+    assert!(work.join("a.txt").exists() && extra.join("b.txt").exists());
+    assert!(!work.join("b.txt").exists() && !extra.join("a.txt").exists());
+}
+
+#[test]
+fn symlinks_never_lead_from_one_root_into_another() {
+    let (daemon, work, extra, outside) = with_extras();
+    let mut peer = daemon.peer();
+    fs::create_dir(work.join("dir")).unwrap();
+    fs::write(work.join("dir/f.txt"), "primary").unwrap();
+    fs::write(extra.join("g.txt"), "extra").unwrap();
+    // From the extra root into the primary one (absolute and relative),
+    // outside, and to /etc; from the primary root into the extra one.
+    symlink(work.join("dir"), extra.join("to-work")).unwrap();
+    symlink("../work/dir", extra.join("rel-work")).unwrap();
+    symlink(work.join("dir/f.txt"), extra.join("work-file")).unwrap();
+    symlink(&outside, extra.join("out")).unwrap();
+    symlink("/etc", extra.join("etc")).unwrap();
+    symlink(&extra, work.join("to-extra")).unwrap();
+    symlink("../extra/g.txt", work.join("extra-file")).unwrap();
+    // And one that stays inside the extra root.
+    symlink("g.txt", extra.join("in")).unwrap();
+    for link in [
+        extra.join("to-work"),
+        extra.join("rel-work"),
+        extra.join("out"),
+        work.join("to-extra"),
+    ] {
+        let listed = peer.call(|request| Request::FileList {
+            request,
+            path: text(&link),
+        });
+        assert_eq!(code_of(listed), Code::OutsideRoot, "{link:?}");
+        for name in ["f.txt", "g.txt", "secret.txt"] {
+            let through = link.join(name);
+            assert_eq!(
+                peer.read(&through, None).unwrap_err().code,
+                Code::OutsideRoot,
+                "{through:?}"
+            );
+        }
+        assert_eq!(
+            peer.write(&link.join("new.txt"), "x", None, true)
+                .unwrap_err()
+                .code,
+            Code::OutsideRoot
+        );
+        assert_eq!(
+            peer.mkdir(&link.join("d")).unwrap_err().code,
+            Code::OutsideRoot
+        );
+    }
+    for file in [
+        extra.join("work-file"),
+        extra.join("etc/passwd"),
+        work.join("extra-file"),
+    ] {
+        assert_eq!(
+            peer.read(&file, None).unwrap_err().code,
+            Code::OutsideRoot,
+            "{file:?}"
+        );
+    }
+    // Listed as links; the link inside the extra root is followed.
+    let (entries, _) = peer.list(&extra);
+    let to_work = entries.iter().find(|e| e.name == "to-work").unwrap();
+    assert_eq!(to_work.kind, Kind::Symlink);
+    assert_eq!(peer.read(&extra.join("in"), None).unwrap().2, b"extra");
+    assert!(!work.join("dir/new.txt").exists() && !work.join("dir/d").exists());
+    assert_eq!(fs::read_dir(&outside).unwrap().count(), 1);
 }

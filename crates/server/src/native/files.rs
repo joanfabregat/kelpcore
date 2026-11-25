@@ -21,6 +21,11 @@
 //!   is read, written, listed or downloaded through it. Mount points inside
 //!   the root stay usable. The root itself can be listed and stat'ed, never
 //!   written, renamed, moved, trashed or deleted.
+//! - Extra roots ([`Settings::extra_roots`], outside the primary root and
+//!   each other) are reachable the same way: a path inside one is resolved
+//!   beneath that root only, so a symlink never leads from one root into
+//!   another (`outside_root`), and a rename between two roots fails with
+//!   `cross_root` (nothing is copied).
 //! - Every change (write, mkdir, rename, trash, delete) acts on the final
 //!   component through its parent's directory descriptor and never follows a
 //!   symlink there: writing to a symlink is refused, deleting or trashing one
@@ -37,7 +42,7 @@
 //!   bits and group. A read-only target is refused, like a shell's `>`. A
 //!   `base_hash` turns the write into a compare-and-swap on the content's
 //!   SHA-256, re-checked against the file's metadata just before the rename.
-//! - `/`, the server user's home directory and the file root are never
+//! - `/`, the server user's home directory and the file roots are never
 //!   removed, and recursive deletion never crosses into another file system.
 //! - Sizes, entry counts, paths per request and concurrent operations are
 //!   bounded ([`LIMITS`], advertised in Welcome `file_limits`).
@@ -102,8 +107,11 @@ const NAME_MAX: usize = 255;
 const TRASHINFO: &str = ".trashinfo";
 /// Most symlinks followed while resolving one path (Linux's own bound).
 pub const MAX_SYMLINKS: usize = 40;
+/// Most extra file roots ([`Settings::extra_roots`]); further ones are
+/// skipped.
+pub const MAX_EXTRA_ROOTS: usize = 64;
 
-/// File bounds advertised in Welcome `file_limits`, with the file root.
+/// File bounds advertised in Welcome `file_limits`, with the file roots.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Limits {
     pub max_read_bytes: u64,
@@ -117,14 +125,20 @@ pub struct Limits {
     /// Absent from servers without downloads.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub downloads: Option<super::downloads::Limits>,
-    /// The file root: every path of a file operation must lie inside it
-    /// (canonical, without symlinks). Absent from servers without the
-    /// boundary, and from a server that could not resolve its root (every
-    /// file operation then fails with `outside_root`).
+    /// The primary file root (canonical, without symlinks). Every path of a
+    /// file operation must lie inside it or inside an extra root (`roots`).
+    /// Absent from servers without the boundary, and from a server that
+    /// could not resolve its root (every file operation then fails with
+    /// `outside_root`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub root: Option<String>,
+    /// Every file root with a label, the primary root (`root`) first, then
+    /// the extra roots. Absent from servers without extra roots support,
+    /// and whenever `root` is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub roots: Option<Vec<NamedRoot>>,
 }
-/// The constant bounds; the server adds its [`Root`] (`root`).
+/// The constant bounds; the server adds its [`Root`] (`root`, `roots`).
 pub const LIMITS: Limits = Limits {
     max_read_bytes: MAX_READ_BYTES,
     max_write_bytes: MAX_WRITE_BYTES,
@@ -135,7 +149,18 @@ pub const LIMITS: Limits = Limits {
     max_depth: MAX_DEPTH,
     downloads: Some(super::downloads::LIMITS),
     root: None,
+    roots: None,
 };
+impl Limits {
+    /// The bounds with `root`'s paths (both absent without a root).
+    pub fn with_root(root: Option<&Root>) -> Self {
+        Self {
+            root: root.map(|root| path_text(root.path())),
+            roots: root.map(Root::named),
+            ..LIMITS
+        }
+    }
+}
 
 /// Server configuration of file operations.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -147,66 +172,79 @@ pub struct Settings {
     /// The folder every file operation is confined to (`--files-root`).
     /// `None` is the server user's home directory (`HOME`, or the password
     /// database's entry when `HOME` is unset or relative). It is resolved
-    /// once, when the server starts ([`Root::new`]).
+    /// once, when the server starts ([`Root::with_extras`]).
     pub root: Option<PathBuf>,
+    /// Further absolute folders outside the primary root that file
+    /// operations may also reach (`--files-extra-root`). Resolved with the
+    /// primary root; one that is missing or overlaps another root is
+    /// skipped.
+    pub extra_roots: Vec<PathBuf>,
 }
 
-/// The folder file operations are confined to, resolved when the server
-/// starts: canonical (its own path has no symlink), an existing directory.
+/// One folder of the file roots, resolved when the server starts:
+/// canonical (its own path has no symlink), an existing directory. Paths
+/// inside it are resolved beneath it and never leave it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Root {
+pub(super) struct Tree {
     path: PathBuf,
     /// The configured spelling when it differs from the canonical one (a
     /// home directory reached through a symlink, say): request paths under
     /// it name the same entries and are answered in the canonical spelling.
     alias: Option<PathBuf>,
-    /// The home directory `~` names, canonical when it can be resolved.
-    home: Option<PathBuf>,
+    /// The directory's device and inode at startup. Every later open of
+    /// the folder must find the same directory ([`Tree::open`]), so that
+    /// replacing it or a parent (with a symlink, say) never redirects file
+    /// operations elsewhere.
+    id: (libc::dev_t, libc::ino_t),
 }
-impl Root {
-    /// Resolve `configured`, or the server user's home directory.
-    pub fn new(configured: Option<&Path>) -> std::result::Result<Self, String> {
-        let home = home();
-        let given = match configured {
-            Some(path) => path.to_path_buf(),
-            None => home
-                .clone()
-                .ok_or("the server user has no absolute home directory")?,
-        };
+impl Tree {
+    /// Resolve the configured folder `given` (`what` names it in errors).
+    fn resolve(given: &Path, what: &str) -> std::result::Result<Self, String> {
         if !given.is_absolute() {
             return Err(format!(
-                "the file root {} is not an absolute path",
+                "the {what} {} is not an absolute path",
                 given.display()
             ));
         }
-        let path = std::fs::canonicalize(&given)
-            .map_err(|error| format!("the file root {}: {error}", given.display()))?;
-        if !path.is_dir() {
-            return Err(format!(
-                "the file root {} is not a directory",
-                given.display()
-            ));
+        let path = std::fs::canonicalize(given)
+            .map_err(|error| format!("the {what} {}: {error}", given.display()))?;
+        // The canonical path's last component is no symlink: opened without
+        // following one, it is the directory recorded below.
+        let fd = cstring(path.as_os_str().as_bytes())
+            .and_then(|cpath| open_at(libc::AT_FDCWD, &cpath, libc::O_PATH | libc::O_NOFOLLOW, 0))
+            .and_then(|fd| stat_fd(fd.as_raw_fd()))
+            .map_err(|error| format!("the {what} {}: {error}", given.display()))?;
+        if !is_dir(&fd) {
+            return Err(format!("the {what} {} is not a directory", given.display()));
         }
-        let alias = normalize_home(&given).ok().filter(|alias| *alias != path);
-        let home = home.and_then(|home| {
-            std::fs::canonicalize(&home)
-                .ok()
-                .or_else(|| normalize_home(&home).ok())
-        });
-        Ok(Self { path, alias, home })
+        let alias = normalize_home(given).ok().filter(|alias| *alias != path);
+        Ok(Self {
+            path,
+            alias,
+            id: (fd.st_dev, fd.st_ino),
+        })
     }
-    /// The canonical path of the root.
-    pub fn path(&self) -> &Path {
+    /// Whether `st` describes this folder (as recorded at startup).
+    fn is(&self, st: &libc::stat) -> bool {
+        (st.st_dev, st.st_ino) == self.id
+    }
+    /// The canonical path of the folder.
+    pub(super) fn path(&self) -> &Path {
         &self.path
     }
-    /// The home directory `~` names.
-    pub fn home(&self) -> Option<&Path> {
-        self.home.as_deref()
+    /// The longest prefix of `path` naming this folder (its canonical path
+    /// or its alias), in components; `None` when `path` is outside.
+    fn prefix(&self, path: &Path) -> Option<usize> {
+        [Some(&self.path), self.alias.as_ref()]
+            .into_iter()
+            .flatten()
+            .filter(|prefix| path.starts_with(prefix))
+            .map(|prefix| prefix.components().count())
+            .max()
     }
-    /// An absolute, normalised path inside the root, spelled from the
-    /// canonical root; `outside_root` otherwise. Purely lexical: symlinks
-    /// are checked when the path is opened ([`open_beneath`]).
-    pub fn confine(&self, path: &Path) -> Outcome<PathBuf> {
+    /// `path` spelled from the canonical folder; `outside_root` when it is
+    /// not inside it. Purely lexical.
+    fn confine(&self, path: &Path) -> Outcome<PathBuf> {
         if path.starts_with(&self.path) {
             return Ok(path.to_path_buf());
         }
@@ -223,19 +261,205 @@ impl Root {
         }
         Err(outside(path))
     }
+    /// A confined path relative to the folder (empty for the folder itself).
+    fn relative<'a>(&self, path: &'a Path) -> Outcome<&'a Path> {
+        path.strip_prefix(&self.path).map_err(|_| outside(path))
+    }
+    /// Open the folder (`O_PATH`), refusing anything but the directory
+    /// recorded at startup: a root replaced since, or reached through a
+    /// parent that was, fails with `outside_root` until the server
+    /// restarts.
+    fn open(&self) -> Outcome<OwnedFd> {
+        let cpath =
+            cstring(self.path.as_os_str().as_bytes()).map_err(|e| io_error(e, &self.path))?;
+        let fd = open_at(libc::AT_FDCWD, &cpath, libc::O_PATH | libc::O_NOFOLLOW, 0)
+            .map_err(|e| io_error(e, &self.path))?;
+        let st = stat_fd(fd.as_raw_fd()).map_err(|e| io_error(e, &self.path))?;
+        if !self.is(&st) {
+            return Err(Error::new(
+                Code::OutsideRoot,
+                "the file root is no longer the folder the server started with",
+            )
+            .at(&self.path));
+        }
+        Ok(fd)
+    }
+}
+
+/// A file root advertised in Welcome `file_limits.roots`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NamedRoot {
+    /// The canonical path.
+    pub path: String,
+    /// A short name for a file browser: `Home` for the primary root when it
+    /// is the home directory, else the folder's name (the full path when
+    /// that name is empty or shared by another root).
+    pub label: String,
+}
+
+/// The folders file operations are confined to, resolved when the server
+/// starts: the primary root, then the extra roots ([`Settings::extra_roots`]).
+/// No root lies inside another, so every confined path belongs to exactly
+/// one of them, and it is resolved beneath that one only: a symlink never
+/// leads from one root into another.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Root {
+    /// The primary root first, then the extra roots in configured order.
+    trees: Vec<Tree>,
+    /// The home directory `~` names, canonical when it can be resolved.
+    home: Option<PathBuf>,
+}
+impl Root {
+    /// Resolve `configured`, or the server user's home directory, with no
+    /// extra root.
+    pub fn new(configured: Option<&Path>) -> std::result::Result<Self, String> {
+        Self::with_extras(configured, &[]).map(|(root, _)| root)
+    }
+    /// Resolve the primary root (`configured`, or the server user's home
+    /// directory) and the extra roots. An extra root that is missing, not
+    /// a directory or not absolute is skipped, and so is one that repeats
+    /// another, lies inside the primary root or another extra root (the
+    /// outer one is kept), or contains the primary root (which would
+    /// widen the boundary around it). Each skip is described in the
+    /// returned warnings; only a primary root that cannot be resolved is an
+    /// error.
+    pub fn with_extras(
+        configured: Option<&Path>,
+        extras: &[PathBuf],
+    ) -> std::result::Result<(Self, Vec<String>), String> {
+        let home = home();
+        let given = match configured {
+            Some(path) => path.to_path_buf(),
+            None => home
+                .clone()
+                .ok_or("the server user has no absolute home directory")?,
+        };
+        let primary = Tree::resolve(&given, "file root")?;
+        let mut warnings = Vec::new();
+        let skip = |warnings: &mut Vec<String>, given: &Path, reason: &str| {
+            warnings.push(format!(
+                "the extra file root {} is skipped: {reason}",
+                given.display()
+            ));
+        };
+        // Resolved, and apart from the primary root.
+        let mut candidates: Vec<(&Path, Tree)> = Vec::new();
+        for (index, extra) in extras.iter().enumerate() {
+            if index >= MAX_EXTRA_ROOTS {
+                skip(&mut warnings, extra, "too many extra file roots");
+                continue;
+            }
+            match Tree::resolve(extra, "extra file root") {
+                Ok(tree) if tree.path.starts_with(&primary.path) => {
+                    skip(&mut warnings, extra, "it is inside the file root")
+                }
+                Ok(tree) if primary.path.starts_with(&tree.path) => {
+                    skip(&mut warnings, extra, "it contains the file root")
+                }
+                Ok(tree) => candidates.push((extra, tree)),
+                Err(error) => warnings.push(format!("{error}; it is skipped")),
+            }
+        }
+        let mut trees = vec![primary];
+        for (index, (given, tree)) in candidates.iter().enumerate() {
+            if candidates[..index]
+                .iter()
+                .any(|(_, other)| other.path == tree.path)
+            {
+                skip(&mut warnings, given, "it repeats another extra file root");
+            } else if candidates
+                .iter()
+                .any(|(_, other)| other.path != tree.path && tree.path.starts_with(&other.path))
+            {
+                skip(&mut warnings, given, "it is inside another extra file root");
+            } else {
+                trees.push(tree.clone());
+            }
+        }
+        let home = home.and_then(|home| {
+            std::fs::canonicalize(&home)
+                .ok()
+                .or_else(|| normalize_home(&home).ok())
+        });
+        Ok((Self { trees, home }, warnings))
+    }
+    /// The canonical path of the primary root.
+    pub fn path(&self) -> &Path {
+        &self.trees[0].path
+    }
+    /// The canonical paths of every root, the primary first.
+    pub fn paths(&self) -> impl Iterator<Item = &Path> {
+        self.trees.iter().map(|tree| tree.path.as_path())
+    }
+    /// Every root with its label, the primary first (Welcome
+    /// `file_limits.roots`).
+    pub fn named(&self) -> Vec<NamedRoot> {
+        let base = |path: &Path| {
+            path.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        };
+        let primary = self.path();
+        let first = if self.home.as_deref() == Some(primary) {
+            "Home".to_owned()
+        } else {
+            base(primary)
+        };
+        let mut labels = vec![first];
+        labels.extend(self.trees[1..].iter().map(|tree| base(&tree.path)));
+        self.trees
+            .iter()
+            .zip(&labels)
+            .enumerate()
+            .map(|(index, (tree, label))| {
+                let shared = labels.iter().filter(|other| *other == label).count() > 1;
+                NamedRoot {
+                    path: path_text(&tree.path),
+                    label: if label.is_empty() || (index > 0 && shared) {
+                        path_text(&tree.path)
+                    } else {
+                        label.clone()
+                    },
+                }
+            })
+            .collect()
+    }
+    /// The home directory `~` names.
+    pub fn home(&self) -> Option<&Path> {
+        self.home.as_deref()
+    }
+    /// An absolute, normalised path inside one of the roots, spelled from
+    /// that root's canonical path; `outside_root` otherwise. The root
+    /// whose path or alias is the longest prefix decides. Purely lexical:
+    /// symlinks are checked when the path is opened ([`open_beneath`]).
+    pub fn confine(&self, path: &Path) -> Outcome<PathBuf> {
+        self.trees
+            .iter()
+            .filter_map(|tree| tree.prefix(path).map(|length| (length, tree)))
+            .max_by_key(|(length, _)| *length)
+            .ok_or_else(|| outside(path))?
+            .1
+            .confine(path)
+    }
     /// A request path, normalised (`~` is the home directory) and confined.
     pub fn request_path(&self, path: &str) -> Outcome<PathBuf> {
         self.confine(&normalize(path, self.home())?)
     }
-    /// A confined path relative to the root (empty for the root itself).
-    pub(super) fn relative<'a>(&self, path: &'a Path) -> Outcome<&'a Path> {
-        path.strip_prefix(&self.path).map_err(|_| outside(path))
+    /// The root a confined path lies in.
+    pub(super) fn tree(&self, path: &Path) -> Outcome<&Tree> {
+        self.trees
+            .iter()
+            .find(|tree| path.starts_with(&tree.path))
+            .ok_or_else(|| outside(path))
     }
-    fn open(&self) -> Outcome<OwnedFd> {
-        let cpath =
-            cstring(self.path.as_os_str().as_bytes()).map_err(|e| io_error(e, &self.path))?;
-        open_at(libc::AT_FDCWD, &cpath, libc::O_PATH | libc::O_DIRECTORY, 0)
-            .map_err(|e| io_error(e, &self.path))
+    /// The primary root.
+    #[cfg(test)]
+    pub(super) fn primary(&self) -> &Tree {
+        &self.trees[0]
+    }
+    /// A confined path relative to its root (empty for a root itself).
+    pub(super) fn relative<'a>(&self, path: &'a Path) -> Outcome<&'a Path> {
+        self.tree(path)?.relative(path)
     }
 }
 fn outside(path: &Path) -> Error {
@@ -309,8 +533,12 @@ pub enum Code {
     Busy,
     /// Any other I/O error; `message` has the system's description.
     Io,
-    /// The path, or a symlink on the way to it, leads outside the file root.
+    /// The path, or a symlink on the way to it, leads outside the file
+    /// roots (or out of the root the path lies in).
     OutsideRoot,
+    /// A rename whose two ends lie in different file roots: entries are not
+    /// moved or copied between roots.
+    CrossRoot,
 }
 /// A structured failure of a file operation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -690,16 +918,17 @@ fn openat2_beneath(dir: RawFd, path: &CStr, flags: libc::c_int) -> io::Result<Ow
     }
     Ok(unsafe { OwnedFd::from_raw_fd(fd as RawFd) })
 }
-/// Open `rel` (relative to the root, as [`Root::relative`] returns it)
-/// beneath the root with `flags`, following symlinks only where they stay
-/// inside it; `follow` decides for the final component (`O_NOFOLLOW`
-/// otherwise). `path` is the absolute path, for errors.
+/// Open `rel` (relative to the root `root`, as [`Root::relative`] returns
+/// it) beneath that root with `flags`, following symlinks only where they
+/// stay inside it, never into another root; `follow` decides for the final
+/// component (`O_NOFOLLOW` otherwise). `path` is the absolute path, for
+/// errors.
 ///
 /// `openat2` with `RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS` resolves it in
 /// the kernel. It refuses an absolute symlink even when the link points
 /// inside the root, and some systems lack it; then [`walk`] decides.
 pub(super) fn open_beneath(
-    root: &Root,
+    root: &Tree,
     rel: &Path,
     flags: libc::c_int,
     follow: bool,
@@ -750,9 +979,10 @@ fn push_components(pending: &mut Vec<Vec<u8>>, bytes: &[u8]) {
 /// kernel never follows a symlink; each symlink met is read and its target
 /// resolved here, an absolute one only when it names a path inside the
 /// root, and `..` returns to the directory it came from, never above the
-/// root. A symlink that leads outside fails with `outside_root`.
+/// root. A symlink that leads outside, into another root included, fails
+/// with `outside_root`.
 fn walk(
-    root: &Root,
+    root: &Tree,
     base: &OwnedFd,
     rel: &Path,
     flags: libc::c_int,
@@ -851,29 +1081,31 @@ pub(super) struct Location {
     pub(super) name: CString,
 }
 pub(super) fn locate(root: &Root, path: &Path) -> Outcome<Location> {
-    let rel = root.relative(path)?;
+    let tree = root.tree(path)?;
+    let rel = tree.relative(path)?;
     let Some(name) = rel.file_name() else {
         return Err(Error::new(
             Code::InvalidRequest,
-            "this operation does not apply to the file root itself",
+            "this operation does not apply to a file root itself",
         )
         .at(path));
     };
     let parent = rel.parent().unwrap_or(Path::new(""));
-    let dir = open_beneath(root, parent, DIRECTORY, true, path)?;
+    let dir = open_beneath(tree, parent, DIRECTORY, true, path)?;
     Ok(Location {
         dir,
         name: cstring(name.as_bytes()).map_err(|e| io_error(e, path))?,
     })
 }
-/// Open a confined path beneath the root (see [`open_beneath`]).
+/// Open a confined path beneath its root (see [`open_beneath`]).
 pub(super) fn open_path(
     root: &Root,
     path: &Path,
     flags: libc::c_int,
     follow: bool,
 ) -> Outcome<OwnedFd> {
-    open_beneath(root, root.relative(path)?, flags, follow, path)
+    let tree = root.tree(path)?;
+    open_beneath(tree, tree.relative(path)?, flags, follow, path)
 }
 /// Open a regular file for reading, following a final symlink within the
 /// root. The type comes first, from an `O_PATH` descriptor: opening a
@@ -1012,9 +1244,10 @@ fn stat(root: &Root, path: &Path) -> Outcome<Entry> {
         || "/".to_owned(),
         |name| name.to_string_lossy().into_owned(),
     );
-    if root.relative(path)?.as_os_str().is_empty() {
-        // The root itself: canonical, so never a symlink.
-        let fd = root.open()?;
+    let tree = root.tree(path)?;
+    if tree.relative(path)?.as_os_str().is_empty() {
+        // A root itself: canonical, so never a symlink.
+        let fd = tree.open()?;
         let st = stat_fd(fd.as_raw_fd()).map_err(|e| io_error(e, path))?;
         return Ok(entry(name, &st, fd.as_raw_fd(), c"."));
     }
@@ -1262,10 +1495,24 @@ fn mkdir(root: &Root, path: &Path) -> Outcome<()> {
 }
 
 fn rename(root: &Root, from: &Path, to: &Path, overwrite: bool) -> Outcome<()> {
+    // Each end is resolved beneath its own root; nothing moves between roots
+    // (often different file systems, and never copied here).
+    if root.tree(from)?.path() != root.tree(to)?.path() {
+        return Err(Error::new(Code::CrossRoot, "cannot move an entry between file roots").at(to));
+    }
     let source = locate(root, from)?;
     let target = locate(root, to)?;
-    // The source must exist (a symlink is moved as a link).
-    stat_at(source.dir.as_raw_fd(), &source.name).map_err(|e| io_error(e, from))?;
+    // The source must exist (a symlink is moved as a link), and be neither
+    // `/`, the home directory nor a root under another name (a bind
+    // mount); nor may an overwritten target be one.
+    let st = stat_at(source.dir.as_raw_fd(), &source.name).map_err(|e| io_error(e, from))?;
+    protect(&st, root, from)?;
+    let replaced = overwrite
+        .then(|| stat_at(target.dir.as_raw_fd(), &target.name).ok())
+        .flatten();
+    if let Some(st) = replaced {
+        protect(&st, root, to)?;
+    }
     let result = if overwrite {
         check(unsafe {
             libc::renameat(
@@ -1369,15 +1616,23 @@ fn remove_entry(
         Err(error) => Err(io_error(error, path)),
     }
 }
-/// Refuse to remove `/`, the server user's home directory or the file root
+/// Refuse to remove `/`, the server user's home directory or a file root
 /// itself, under whatever path names it (a bind mount, say; `st` is the
 /// entry's `lstat`, so a symlink to one is not protected: removing it
-/// removes only the link).
+/// removes only the link). The roots are matched by the device and inode
+/// recorded at startup, not by looking their paths up again.
 fn protect(st: &libc::stat, root: &Root, path: &Path) -> Outcome<()> {
-    for protected in [Some(Path::new("/")), root.home(), Some(root.path())]
-        .into_iter()
-        .flatten()
-    {
+    let refuse = || {
+        Err(Error::new(
+            Code::InvalidRequest,
+            "refusing to remove or move /, the home directory or a file root",
+        )
+        .at(path))
+    };
+    if root.trees.iter().any(|tree| tree.is(st)) {
+        return refuse();
+    }
+    for protected in [Path::new("/")].into_iter().chain(root.home()) {
         let Ok(name) = cstring(protected.as_os_str().as_bytes()) else {
             continue;
         };
@@ -1386,11 +1641,7 @@ fn protect(st: &libc::stat, root: &Root, path: &Path) -> Outcome<()> {
         if unsafe { libc::fstatat(libc::AT_FDCWD, name.as_ptr(), &mut other, 0) } == 0
             && (other.st_dev, other.st_ino) == (st.st_dev, st.st_ino)
         {
-            return Err(Error::new(
-                Code::InvalidRequest,
-                "refusing to remove /, the home directory or the file root",
-            )
-            .at(path));
+            return refuse();
         }
     }
     Ok(())
@@ -1474,6 +1725,9 @@ struct Trash {
     files: OwnedFd,
     info: OwnedFd,
     dev: libc::dev_t,
+    /// The canonical path of `files/`, when it can be learnt: it decides
+    /// which root's entries may be trashed ([`trash_allowed`]).
+    place: Option<PathBuf>,
 }
 fn private_dir_at(parent: RawFd, name: &CStr, path: &Path) -> Outcome<OwnedFd> {
     if unsafe { libc::mkdirat(parent, name.as_ptr(), 0o700) } != 0 {
@@ -1518,12 +1772,43 @@ fn open_trash(settings: &Settings) -> Outcome<Trash> {
     let dev = stat_fd(files.as_raw_fd())
         .map_err(|e| io_error(e, &root))?
         .st_dev;
+    // Where the opened `files/` directory really is, symlinks resolved.
+    let place = std::fs::read_link(format!("/proc/self/fd/{}", files.as_raw_fd()))
+        .ok()
+        .filter(|path| path.is_absolute())
+        .or_else(|| std::fs::canonicalize(root.join("files")).ok());
     Ok(Trash {
         root,
         files,
         info,
         dev,
+        place,
     })
+}
+/// Refuse to trash `path` when that would move it into another file root:
+/// an entry may go to a trash inside its own root, and an entry of the
+/// primary root also to a trash outside every root (server configuration,
+/// as before extra roots). A trash whose place is unknown takes nothing.
+fn trash_allowed(trash: &Trash, root: &Root, path: &Path) -> Outcome<()> {
+    let tree = root.tree(path)?;
+    let allowed = trash.place.as_deref().is_some_and(|place| {
+        match root
+            .trees
+            .iter()
+            .find(|other| place.starts_with(&other.path))
+        {
+            Some(holder) => holder.path == tree.path,
+            None => tree.path == root.trees[0].path,
+        }
+    });
+    if allowed {
+        return Ok(());
+    }
+    Err(Error::new(
+        Code::CrossRoot,
+        "the trash is outside this file root; delete the entry instead",
+    )
+    .at(path))
 }
 /// Move one entry to the trash: reserve a unique `info/<name>.trashinfo`
 /// with `O_EXCL`, write and sync it, then rename the entry to
@@ -1534,6 +1819,7 @@ fn trash_one(trash: &Trash, root: &Root, path: &Path) -> Outcome<PathBuf> {
     let dir = location.dir.as_raw_fd();
     let entry = stat_at(dir, &location.name).map_err(|e| io_error(e, path))?;
     protect(&entry, root, path)?;
+    trash_allowed(trash, root, path)?;
     let st = stat_fd(dir).map_err(|e| io_error(e, path))?;
     if st.st_dev != trash.dev {
         return Err(Error::new(
@@ -1880,7 +2166,7 @@ mod tests {
         assert_eq!(error.code, Code::InvalidRequest);
         let trash = open_trash(&Settings {
             trash_dir: Some(trash_dir.clone()),
-            root: None,
+            ..Default::default()
         })
         .unwrap();
         let error = trash_one(&trash, &root, &base).unwrap_err();
@@ -1945,9 +2231,236 @@ mod tests {
         std::fs::remove_dir_all(&base).unwrap();
     }
     #[test]
+    fn extra_roots_are_resolved_apart_from_each_other() {
+        use std::os::unix::fs::symlink;
+        let (base, _) = scratch("extras");
+        for dir in ["primary/in", "e/inner", "x/data", "y/data", "z"] {
+            std::fs::create_dir_all(base.join(dir)).unwrap();
+        }
+        std::fs::write(base.join("f"), "").unwrap();
+        // An extra root configured through a symlink inside the primary root.
+        symlink(base.join("z"), base.join("primary/z-link")).unwrap();
+        let primary = base.join("primary");
+        let extras = [
+            "e",
+            "e/inner",
+            "missing",
+            "f",
+            "primary/in",
+            "",
+            "e",
+            "x/data",
+            "y/data",
+            "primary/z-link",
+        ]
+        .map(|rel| {
+            if rel.is_empty() {
+                base.clone()
+            } else {
+                base.join(rel)
+            }
+        });
+        let mut configured = extras.to_vec();
+        configured.push(PathBuf::from("relative"));
+        let (root, warnings) = Root::with_extras(Some(&primary), &configured).unwrap();
+        let paths: Vec<_> = root.paths().map(Path::to_path_buf).collect();
+        assert_eq!(
+            paths,
+            [
+                primary.clone(),
+                base.join("e"),
+                base.join("x/data"),
+                base.join("y/data"),
+                base.join("z"),
+            ]
+        );
+        // One warning per skipped root, naming it.
+        assert_eq!(warnings.len(), 7, "{warnings:?}");
+        for (skipped, reason) in [
+            (base.join("e/inner"), "inside another extra file root"),
+            (base.join("e"), "repeats another extra file root"),
+            (base.join("missing"), "No such file"),
+            (base.join("f"), "not a directory"),
+            (base.join("primary/in"), "inside the file root"),
+            (base.clone(), "contains the file root"),
+            (PathBuf::from("relative"), "not an absolute path"),
+        ] {
+            let name = skipped.display().to_string();
+            assert!(
+                warnings
+                    .iter()
+                    .any(|w| w.contains(&format!("root {name}")) && w.contains(reason)),
+                "{name}: {warnings:?}"
+            );
+        }
+        assert!(warnings.iter().all(|w| w.contains("skipped")));
+        // The repeat of `e` is dropped too, without a separate root.
+        assert_eq!(paths.iter().filter(|p| **p == base.join("e")).count(), 1);
+        // Labels: the folder's name, the full path when two share it.
+        let labels: Vec<_> = root.named().into_iter().map(|n| n.label).collect();
+        let full = |rel: &str| base.join(rel).display().to_string();
+        assert_eq!(
+            labels,
+            [
+                "primary".into(),
+                "e".into(),
+                full("x/data"),
+                full("y/data"),
+                "z".into()
+            ]
+        );
+        // Each path is confined to the root it lies in; the longest prefix
+        // wins, so the symlinked spelling names the extra root `z`.
+        assert_eq!(
+            root.confine(&base.join("e/inner/a")).unwrap(),
+            base.join("e/inner/a")
+        );
+        assert_eq!(
+            root.confine(&base.join("primary/z-link/a")).unwrap(),
+            base.join("z/a")
+        );
+        assert_eq!(root.tree(&base.join("z/a")).unwrap().path(), base.join("z"));
+        for outside in [base.join("f"), base.join("x"), base.clone()] {
+            assert_eq!(
+                root.confine(&outside).unwrap_err().code,
+                Code::OutsideRoot,
+                "{outside:?}"
+            );
+        }
+        // Too many extra roots: the ones beyond the bound are skipped.
+        let many = vec![base.join("e"); MAX_EXTRA_ROOTS + 2];
+        let (root, warnings) = Root::with_extras(Some(&primary), &many).unwrap();
+        assert_eq!(root.paths().count(), 2);
+        assert_eq!(
+            warnings
+                .iter()
+                .filter(|w| w.contains("too many extra file roots"))
+                .count(),
+            2
+        );
+        // No extra root: as `Root::new`.
+        assert_eq!(
+            Root::with_extras(Some(&primary), &[]).unwrap().0,
+            Root::new(Some(&primary)).unwrap()
+        );
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+    #[test]
+    fn every_root_is_protected_and_renames_stay_inside_one() {
+        let (base, _) = scratch("protect-extras");
+        for dir in ["primary/d", "extra/d"] {
+            std::fs::create_dir_all(base.join(dir)).unwrap();
+        }
+        std::fs::write(base.join("primary/a"), "a").unwrap();
+        let (primary, extra) = (base.join("primary"), base.join("extra"));
+        let (root, _) = Root::with_extras(Some(&primary), std::slice::from_ref(&extra)).unwrap();
+        assert_eq!(
+            delete(&root, &extra).unwrap_err().code,
+            Code::InvalidRequest
+        );
+        let error = rename(&root, &primary.join("a"), &extra.join("a"), false).unwrap_err();
+        assert_eq!(error.code, Code::CrossRoot);
+        assert_eq!(
+            rename(&root, &extra.join("d"), &primary.join("e"), true)
+                .unwrap_err()
+                .code,
+            Code::CrossRoot
+        );
+        rename(&root, &extra.join("d"), &extra.join("e"), false).unwrap();
+        assert!(primary.join("a").exists() && extra.join("e").is_dir());
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+    #[test]
+    fn the_trash_never_moves_an_entry_into_another_root() {
+        let (base, _) = scratch("trash-extras");
+        for dir in ["primary/d", "extra/d", "elsewhere"] {
+            std::fs::create_dir_all(base.join(dir)).unwrap();
+        }
+        let (primary, extra) = (base.join("primary"), base.join("extra"));
+        let (root, _) = Root::with_extras(Some(&primary), std::slice::from_ref(&extra)).unwrap();
+        let trash_in = |dir: PathBuf| {
+            open_trash(&Settings {
+                trash_dir: Some(dir),
+                ..Default::default()
+            })
+            .unwrap()
+        };
+        let reset = || {
+            std::fs::write(primary.join("d/a"), "a").unwrap();
+            std::fs::write(extra.join("d/b"), "b").unwrap();
+        };
+        // A trash inside the primary root, on the extra root's file system:
+        // an entry of the extra root stays where it is.
+        reset();
+        let trash = trash_in(primary.join(".local/share/Trash"));
+        let error = trash_one(&trash, &root, &extra.join("d/b")).unwrap_err();
+        assert_eq!(error.code, Code::CrossRoot);
+        assert!(extra.join("d/b").exists());
+        trash_one(&trash, &root, &primary.join("d/a")).unwrap();
+        // A trash inside the extra root takes only the extra root's entries.
+        reset();
+        let trash = trash_in(extra.join(".Trash"));
+        trash_one(&trash, &root, &extra.join("d/b")).unwrap();
+        let error = trash_one(&trash, &root, &primary.join("d/a")).unwrap_err();
+        assert_eq!(error.code, Code::CrossRoot);
+        assert!(primary.join("d/a").exists());
+        // A trash outside every root (server configuration) takes the
+        // primary root's entries, as before extra roots.
+        reset();
+        let trash = trash_in(base.join("elsewhere/Trash"));
+        trash_one(&trash, &root, &primary.join("d/a")).unwrap();
+        let error = trash_one(&trash, &root, &extra.join("d/b")).unwrap_err();
+        assert_eq!(error.code, Code::CrossRoot);
+        assert!(extra.join("d/b").exists());
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+    #[test]
+    fn a_root_replaced_after_startup_is_refused() {
+        use std::os::unix::fs::symlink;
+        let (base, _) = scratch("swapped");
+        for dir in ["primary", "data/extra", "secret"] {
+            std::fs::create_dir_all(base.join(dir)).unwrap();
+        }
+        std::fs::write(base.join("data/extra/f.txt"), "extra").unwrap();
+        std::fs::write(base.join("secret/key"), "secret").unwrap();
+        let (primary, extra) = (base.join("primary"), base.join("data/extra"));
+        let (root, _) = Root::with_extras(Some(&primary), std::slice::from_ref(&extra)).unwrap();
+        assert_eq!(list(&root, &extra).unwrap().0.len(), 1);
+        // Someone able to change the extra root's parent swaps the root for
+        // a symlink to another folder; the server refuses that root.
+        std::fs::rename(&extra, base.join("data/moved")).unwrap();
+        symlink(base.join("secret"), &extra).unwrap();
+        assert_eq!(list(&root, &extra).unwrap_err().code, Code::OutsideRoot);
+        assert_eq!(
+            read(&root, &extra.join("key"), None).err().unwrap().code,
+            Code::OutsideRoot
+        );
+        assert_eq!(stat(&root, &extra).unwrap_err().code, Code::OutsideRoot);
+        assert_eq!(
+            write(&root, &extra.join("new"), b"x", None, true)
+                .err()
+                .unwrap()
+                .code,
+            Code::OutsideRoot
+        );
+        assert_eq!(std::fs::read_dir(base.join("secret")).unwrap().count(), 1);
+        // A parent swapped for a symlink to a copy is refused the same way.
+        std::fs::remove_file(&extra).unwrap();
+        std::fs::rename(base.join("data"), base.join("data-old")).unwrap();
+        std::fs::create_dir_all(base.join("copy/extra")).unwrap();
+        symlink(base.join("copy"), base.join("data")).unwrap();
+        assert_eq!(list(&root, &extra).unwrap_err().code, Code::OutsideRoot);
+        // The primary root is held to its recorded identity too.
+        std::fs::rename(&primary, base.join("primary-old")).unwrap();
+        std::fs::create_dir(&primary).unwrap();
+        assert_eq!(list(&root, &primary).unwrap_err().code, Code::OutsideRoot);
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+    #[test]
     fn the_walk_resolves_symlinks_beneath_the_root() {
         use std::os::unix::fs::symlink;
         let (base, root) = scratch("walk");
+        let tree = root.primary();
         std::fs::create_dir_all(base.join("a/b")).unwrap();
         std::fs::write(base.join("a/b/f.txt"), "inside").unwrap();
         symlink("a/b", base.join("rel")).unwrap();
@@ -1959,9 +2472,9 @@ mod tests {
         symlink("loop2", base.join("loop1")).unwrap();
         symlink("loop1", base.join("loop2")).unwrap();
         let read = |rel: &str| -> Outcome<String> {
-            let base_fd = root.open()?;
+            let base_fd = tree.open()?;
             let path = base.join(rel);
-            let fd = walk(&root, &base_fd, Path::new(rel), libc::O_RDONLY, &path)?;
+            let fd = walk(tree, &base_fd, Path::new(rel), libc::O_RDONLY, &path)?;
             let mut text = String::new();
             File::from(fd).read_to_string(&mut text).unwrap();
             Ok(text)
@@ -1984,11 +2497,11 @@ mod tests {
         }
         assert_eq!(read("loop1").unwrap_err().code, Code::Symlink);
         // The root itself, and a final symlink not followed.
-        let base_fd = root.open().unwrap();
-        let fd = walk(&root, &base_fd, Path::new(""), DIRECTORY, &base).unwrap();
+        let base_fd = tree.open().unwrap();
+        let fd = walk(tree, &base_fd, Path::new(""), DIRECTORY, &base).unwrap();
         assert!(is_dir(&stat_fd(fd.as_raw_fd()).unwrap()));
         let fd = walk(
-            &root,
+            tree,
             &base_fd,
             Path::new("etc"),
             libc::O_PATH | libc::O_NOFOLLOW,
@@ -1997,7 +2510,7 @@ mod tests {
         .unwrap();
         assert!(is_symlink(&stat_fd(fd.as_raw_fd()).unwrap()));
         // `open_beneath` agrees, through `openat2` where it can.
-        let open = |rel: &str| open_beneath(&root, Path::new(rel), libc::O_RDONLY, true, &base);
+        let open = |rel: &str| open_beneath(tree, Path::new(rel), libc::O_RDONLY, true, &base);
         assert!(open("abs/b/f.txt").is_ok());
         assert!(open("rel/up").is_ok());
         assert_eq!(open("etc/passwd").unwrap_err().code, Code::OutsideRoot);
@@ -2009,6 +2522,7 @@ mod tests {
         use std::os::unix::fs::symlink;
         use std::sync::Arc;
         let (base, root) = scratch("race");
+        let tree = root.primary();
         let outside = base.with_extension("outside");
         let _ = std::fs::remove_dir_all(&outside);
         std::fs::create_dir_all(&outside).unwrap();
@@ -2044,10 +2558,10 @@ mod tests {
             let result = if attempt % 2 == 0 {
                 read(&root, &path, None).map(|content| content.content)
             } else {
-                root.open()
+                tree.open()
                     .and_then(|base_fd| {
                         walk(
-                            &root,
+                            tree,
                             &base_fd,
                             Path::new("swap/f.txt"),
                             libc::O_RDONLY,

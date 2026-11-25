@@ -11,8 +11,9 @@
 //! memory or output queue. Nothing is built whole in memory or on disk.
 //!
 //! The same care as the other file operations applies: every selected path
-//! must lie inside the file root and is opened beneath it (`outside_root`
-//! otherwise, the root itself is not downloaded); a single file is opened
+//! must lie inside a file root (the primary or an extra root) and is opened
+//! beneath that root (`outside_root` otherwise, a root itself is not
+//! downloaded); a single file is opened
 //! like `file_read` opens it (the type checked first, never a device or
 //! FIFO); an archive walks its folders through directory descriptors
 //! opened with `O_NOFOLLOW`, stores symlinks as links without following
@@ -317,7 +318,7 @@ fn download(
         if root.relative(&checked)?.as_os_str().is_empty() {
             return Err(at(Error::new(
                 Code::InvalidRequest,
-                "the file root itself is not downloaded; select the entries inside it",
+                "a file root itself is not downloaded; select the entries inside it",
             )));
         }
         normalized.push(checked);

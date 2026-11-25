@@ -1081,14 +1081,7 @@ impl Server {
                 limits: Some(super::stream::LIMITS),
                 notification_run: Some(self.activity.run().to_owned()),
                 upload_limits: Some(super::uploads::LIMITS),
-                file_limits: Some(super::files::Limits {
-                    root: self
-                        .files
-                        .root
-                        .as_ref()
-                        .map(|root| super::files::path_text(root.path())),
-                    ..super::files::LIMITS
-                }),
+                file_limits: Some(super::files::Limits::with_root(self.files.root.as_ref())),
             };
             let client = self.clients.get_mut(&id).unwrap();
             if client.stream.is_some() {
@@ -2876,9 +2869,18 @@ pub fn serve(config: ServerConfig) -> Result<()> {
     let mut uploads = super::uploads::Uploads::new(&config.state_dir, &config.uploads)?;
     uploads.sweep(crate::now());
     // Terminals do not depend on it: without a root, file operations are
-    // refused (`outside_root`) and the server still runs.
-    let file_root = match super::files::Root::new(config.files.root.as_deref()) {
-        Ok(root) => Some(root),
+    // refused (`outside_root`) and the server still runs. An extra root
+    // that cannot be used is skipped with a warning.
+    let file_root = match super::files::Root::with_extras(
+        config.files.root.as_deref(),
+        &config.files.extra_roots,
+    ) {
+        Ok((root, warnings)) => {
+            for warning in warnings {
+                eprintln!("kelpserver: {warning}");
+            }
+            Some(root)
+        }
         Err(error) => {
             eprintln!("kelpserver: file operations are disabled: {error}");
             None

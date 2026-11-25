@@ -8,8 +8,9 @@
 //!
 //! Every batch is a new private (0700) directory under the upload root
 //! (`$XDG_CACHE_HOME/kelpserver/uploads` by default) or under a client-chosen
-//! existing directory owned by the server's user inside the file root
-//! (`files::Root`, resolved beneath it like every file operation). The
+//! existing directory owned by the server's user inside a file root
+//! (`files::Root`: the primary or an extra root, resolved beneath that root
+//! like every file operation). The
 //! upload root itself is server configuration and need not lie inside the
 //! file root. Files are written to private
 //! temporary names (0600, `O_EXCL`, `O_NOFOLLOW`), synced and renamed into
@@ -598,12 +599,17 @@ impl Uploads {
                     return Err("upload destination must be an absolute normalized path".into());
                 }
                 // A client-chosen destination is confined like every file
-                // operation: inside the file root, opened beneath it.
+                // operation: inside a file root, opened beneath that root.
                 let files_root = files_root.ok_or_else(|| super::files::no_root().message)?;
                 let dest = files_root.confine(dest).map_err(|_| {
+                    let roots: Vec<_> = files_root
+                        .paths()
+                        .map(|path| path.display().to_string())
+                        .collect();
                     format!(
-                        "upload destination is outside the file root {}",
-                        files_root.path().display()
+                        "upload destination is outside the file root{} {}",
+                        if roots.len() > 1 { "s" } else { "" },
+                        roots.join(", ")
                     )
                 })?;
                 let fd = super::files::open_path(

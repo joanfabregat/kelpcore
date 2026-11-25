@@ -89,6 +89,34 @@ test("file limits are read from the Welcome and checked", () => {
   for (const bad of ["relative", "", 7, "/a\0b", "/" + "x".repeat(4096)])
     assert.equal(readFileLimits({ ...limits, root: bad }).root, undefined);
   assert.equal(describeCode("outside_root"), "Outside the folders this server lets you browse");
+  // Every root with its label, the primary first; malformed entries and
+  // repeats are dropped, and the list is ignored without its `root`.
+  const roots = [
+    { path: "/home/me", label: "Home" },
+    { path: "/mnt/data", label: "data" },
+  ];
+  assert.deepEqual(readFileLimits({ ...limits, root: "/home/me", roots }).roots, roots);
+  assert.deepEqual(
+    readFileLimits({
+      ...limits,
+      root: "/home/me",
+      roots: [
+        ...roots,
+        { path: "/mnt/data/", label: "again" },
+        { path: "relative", label: "x" },
+        { path: "/srv", label: "" },
+        { path: "/srv", label: 7 },
+        null,
+        "/srv",
+      ],
+    }).roots,
+    roots,
+  );
+  assert.equal(readFileLimits({ ...limits, roots }).roots, undefined);
+  assert.equal(readFileLimits({ ...limits, root: "/mnt/data", roots }).roots, undefined);
+  assert.equal(readFileLimits({ ...limits, root: "/home/me", roots: "x" }).roots, undefined);
+  assert.equal(readFileLimits({ ...limits, root: "/home/me" }).roots, undefined);
+  assert.equal(describeCode("cross_root"), "Entries cannot move between these folders");
 });
 
 test("file events are recognised by type or by the request they answer", () => {

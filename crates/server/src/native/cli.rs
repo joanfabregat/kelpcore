@@ -19,6 +19,9 @@ struct Options {
     uploads: super::uploads::Settings,
     /// `--files-root`: the folder file operations are confined to.
     files_root: Option<PathBuf>,
+    /// `--files-extra-root` (repeatable): further folders file operations
+    /// may reach. `None` when the command line names none.
+    files_extra_roots: Option<Vec<PathBuf>>,
 }
 fn options(args: &[String]) -> Result<Options> {
     let state = super::lifecycle::workspace_path("main")?;
@@ -36,6 +39,7 @@ fn options(args: &[String]) -> Result<Options> {
         background: false,
         uploads: Default::default(),
         files_root: None,
+        files_extra_roots: None,
     };
     let verb = args.first().ok_or("missing native command")?;
     let mut position = 1;
@@ -90,6 +94,12 @@ fn options(args: &[String]) -> Result<Options> {
                 }
                 "--files-root" if matches!(verb.as_str(), "server" | "start") => {
                     result.files_root = Some(PathBuf::from(value));
+                }
+                "--files-extra-root" if matches!(verb.as_str(), "server" | "start") => {
+                    result
+                        .files_extra_roots
+                        .get_or_insert_with(Vec::new)
+                        .push(PathBuf::from(value));
                 }
                 "--upload-retention-days" if matches!(verb.as_str(), "server" | "start") => {
                     let days: u32 = value
@@ -160,6 +170,10 @@ fn options(args: &[String]) -> Result<Options> {
     if result.files_root.is_none() {
         result.files_root = settings.files_root;
     }
+    // The command line's list replaces the configuration file's whole.
+    if result.files_extra_roots.is_none() {
+        result.files_extra_roots = settings.files_extra_roots;
+    }
     if let Some(cwd) = settings.cwd {
         if !cwd_explicit {
             result.cwd = cwd;
@@ -182,6 +196,14 @@ fn options(args: &[String]) -> Result<Options> {
     }
     if let Some(root) = &result.files_root {
         result.files_root = Some(absolute(root)?);
+    }
+    if let Some(roots) = &result.files_extra_roots {
+        result.files_extra_roots = Some(
+            roots
+                .iter()
+                .map(|root| absolute(root))
+                .collect::<Result<_>>()?,
+        );
     }
     Ok(result)
 }
@@ -210,6 +232,7 @@ pub fn run(args: &[String]) -> Result<()> {
                 uploads: options.uploads,
                 files: super::files::Settings {
                     root: options.files_root,
+                    extra_roots: options.files_extra_roots.unwrap_or_default(),
                     ..Default::default()
                 },
             })
@@ -227,6 +250,13 @@ pub fn run(args: &[String]) -> Result<()> {
             if let Some(root) = &options.files_root {
                 super::lifecycle::private_state(&options.state)?;
                 super::lifecycle::persist_files_root(&options.state.join("workspace.json"), root)?;
+            }
+            if let Some(roots) = &options.files_extra_roots {
+                super::lifecycle::private_state(&options.state)?;
+                super::lifecycle::persist_files_extra_roots(
+                    &options.state.join("workspace.json"),
+                    roots,
+                )?;
             }
             super::lifecycle::start(super::lifecycle::StartRequest {
                 socket: &options.socket,
