@@ -5,6 +5,26 @@ use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, fs, io::Read, os::unix::fs::MetadataExt, path::Path};
 
 const LIMIT: usize = 256;
+/// Agent conversations kept per entry; the oldest are dropped first.
+pub const SESSION_LIMIT: usize = 32;
+/// `last_seen` only advances in steps of this many seconds, so an agent
+/// that stays open does not rewrite the history file on every discovery.
+pub const LAST_SEEN_STEP: u64 = 60;
+
+/// One agent conversation a pane hosted, in the order the server saw them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Session {
+    pub kind: Kind,
+    /// The provider's conversation ID (validated by `crate::session_id`).
+    pub id: String,
+    /// The pane's folder when the conversation was first seen; resume runs there.
+    pub cwd: String,
+    /// Epoch seconds.
+    pub first_seen: u64,
+    /// Epoch seconds, advanced in `LAST_SEEN_STEP` steps.
+    pub last_seen: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Entry {
     pub key: String,
@@ -13,12 +33,42 @@ pub struct Entry {
     pub cwd: String,
     pub name: String,
     pub kind: Option<Kind>,
+    /// The latest conversation; kept for compatibility, see `sessions`.
     pub session_id: Option<String>,
     pub argv: Vec<String>,
     pub closed_at: Option<u64>,
     pub reason: String,
+    /// Every conversation the pane hosted, oldest first, at most `SESSION_LIMIT`.
+    #[serde(default)]
+    pub sessions: Vec<Session>,
 }
 impl Entry {
+    /// Record the conversation a pane currently runs, if it has a valid one.
+    fn record_session(&mut self, kind: Option<Kind>, id: Option<&str>, cwd: &str, at: u64) {
+        let (Some(kind), Some(id)) = (kind, id.filter(|id| crate::session_id(id))) else {
+            return;
+        };
+        match self.sessions.last_mut() {
+            Some(last) if last.id == id && last.kind == kind => {
+                if at >= last.last_seen.saturating_add(LAST_SEEN_STEP) {
+                    last.last_seen = at;
+                }
+            }
+            _ => {
+                self.sessions.push(Session {
+                    kind,
+                    id: id.into(),
+                    cwd: cwd.into(),
+                    first_seen: at,
+                    last_seen: at,
+                });
+                if self.sessions.len() > SESSION_LIMIT {
+                    let excess = self.sessions.len() - SESSION_LIMIT;
+                    self.sessions.drain(..excess);
+                }
+            }
+        }
+    }
     /// Construct only trusted agent invocations; ordinary commands are opt-in.
     pub fn command(&self) -> Option<String> {
         self.kind.map(|kind| {
@@ -96,6 +146,17 @@ impl History {
         panes: &[PaneInfo],
         commands: &BTreeMap<u64, Vec<String>>,
     ) {
+        self.observe_at(run, workspace, panes, commands, crate::now());
+    }
+    /// `observe` at an explicit time (epoch seconds).
+    pub fn observe_at(
+        &mut self,
+        run: &str,
+        workspace: &str,
+        panes: &[PaneInfo],
+        commands: &BTreeMap<u64, Vec<String>>,
+        at: u64,
+    ) {
         for pane in panes {
             let key = format!("{run}:{}", pane.id);
             let argv = commands.get(&pane.id).cloned().unwrap_or_default();
@@ -111,7 +172,7 @@ impl History {
             } else {
                 pane.title.clone()
             };
-            let entry = Entry {
+            let mut entry = Entry {
                 key: key.clone(),
                 workspace: workspace.into(),
                 pane: pane.id,
@@ -122,14 +183,21 @@ impl History {
                 argv,
                 closed_at: None,
                 reason: String::new(),
+                sessions: Vec::new(),
             };
-            if let Some(old) = self.entries.iter_mut().find(|entry| entry.key == key) {
+            // Everything else is replaced on observation; the conversations accumulate.
+            let mut old = self.entries.iter_mut().find(|entry| entry.key == key);
+            if let Some(old) = &mut old {
+                entry.sessions = std::mem::take(&mut old.sessions);
+            }
+            entry.record_session(pane.kind, pane.session_id.as_deref(), &pane.cwd, at);
+            if let Some(old) = old {
                 *old = entry;
             } else {
                 self.entries.insert(0, entry);
             }
         }
-        self.prune(crate::now());
+        self.prune(at);
     }
     pub fn close(&mut self, run: &str, pane: u64, at: u64) {
         if let Some(entry) = self
