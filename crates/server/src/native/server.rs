@@ -2096,6 +2096,9 @@ impl Server {
                 if closed.iter().any(|h| {
                     h.workspace == item.workspace
                         && (h.session_id.is_some() && h.session_id == e.session_id
+                            || e.session_id.as_deref().is_some_and(|id| {
+                                h.sessions.iter().any(|s| s.kind == e.kind && s.id == id)
+                            })
                             || !h.key.starts_with("legacy:")
                                 && h.cwd == e.cwd
                                 && h.kind == Some(e.kind)
@@ -2114,6 +2117,18 @@ impl Server {
                     argv: vec![],
                     closed_at: Some(at),
                     reason: "Previous run".into(),
+                    sessions: e
+                        .session_id
+                        .iter()
+                        .filter(|id| crate::session_id(id))
+                        .map(|id| super::history::Session {
+                            kind: e.kind,
+                            id: id.clone(),
+                            cwd: e.cwd.clone(),
+                            first_seen: e.first_seen,
+                            last_seen: e.last_seen,
+                        })
+                        .collect(),
                 });
             }
         }
